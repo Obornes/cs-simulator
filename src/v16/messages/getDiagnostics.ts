@@ -1,6 +1,6 @@
 import { z } from "zod";
-import { OcppCall, OcppMessage } from "../../ocppMessage";
-import { VCP } from "../../vcp";
+import { type OcppCall, OcppIncoming } from "../../ocppMessage";
+import type { VCP } from "../../vcp";
 
 const GetDiagnosticsReqSchema = z.object({
   location: z.string().url(),
@@ -16,7 +16,7 @@ const GetDiagnosticsResSchema = z.object({
 });
 type GetDiagnosticsResType = typeof GetDiagnosticsResSchema;
 
-class GetDiagnosticsOcppMessage extends OcppMessage<
+class GetDiagnosticsOcppMessage extends OcppIncoming<
   GetDiagnosticsReqType,
   GetDiagnosticsResType
 > {
