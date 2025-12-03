@@ -2,6 +2,7 @@ import { z } from "zod";
 import { type OcppCall, OcppIncoming } from "../../ocppMessage";
 import type { VCP } from "../../vcp";
 import { ConnectorIdSchema } from "./_common";
+import { chargingProfileManager } from "../chargingProfileManager";
 
 const ClearChargingProfileReqSchema = z.object({
   id: z.number().int().nullish(),
@@ -26,6 +27,12 @@ class ClearChargingProfileOcppMessage extends OcppIncoming<
     vcp: VCP,
     call: OcppCall<z.infer<ClearChargingProfileReqType>>,
   ): Promise<void> => {
+    chargingProfileManager.clearProfiles({
+      id: call.payload.id ?? undefined,
+      connectorId: call.payload.connectorId ?? undefined,
+      chargingProfilePurpose: call.payload.chargingProfilePurpose ?? undefined,
+      stackLevel: call.payload.stackLevel ?? undefined,
+    });
     vcp.respond(this.response(call, { status: "Accepted" }));
   };
 }

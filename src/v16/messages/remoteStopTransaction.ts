@@ -24,7 +24,9 @@ class RemoteStopTransactionOcppMessage extends OcppIncoming<
     call: OcppCall<z.infer<RemoteStopTransactionReqType>>,
   ): Promise<void> => {
     const transactionId = call.payload.transactionId;
-    const transaction = vcp.transactionManager.transactions.get(transactionId);
+    const transaction = vcp.transactionManager.transactions.get(
+      transactionId.toString(),
+    );
     if (!transaction) {
       vcp.respond(this.response(call, { status: "Rejected" }));
       return;

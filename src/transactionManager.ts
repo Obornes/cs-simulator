@@ -1,31 +1,22 @@
 import type { VCP } from "./vcp";
+import { meterValuesOcppMessage } from "./v16/messages/meterValues";
+import { chargingProfileManager } from "./v16/chargingProfileManager";
 
 const METER_VALUES_INTERVAL_SEC = 15;
-
-type TransactionId = string | number;
+const DEFAULT_POWER_WATTS = 11000;
 
 interface TransactionState {
+  transactionId: number;
+  idTag: string;
+  accumulatedEnergyWh: number;
   startedAt: Date;
-  idTag: string;
-  transactionId: TransactionId;
-  meterValue: number;
-  evseId?: number;
   connectorId: number;
-}
-
-interface StartTransactionProps {
-  transactionId: TransactionId;
-  idTag: string;
-  evseId?: number;
-  connectorId: number;
-  meterValuesCallback: (transactionState: TransactionState) => Promise<void>;
+  meterValuesTimer?: NodeJS.Timer;
+  lastUpdateTime: Date;
 }
 
 export class TransactionManager {
-  transactions: Map<
-    TransactionId,
-    TransactionState & { meterValuesTimer: NodeJS.Timer }
-  > = new Map();
+  transactions: Map<string, TransactionState> = new Map();
 
   canStartNewTransaction(connectorId: number) {
     return !Array.from(this.transactions.values()).some(
@@ -33,43 +24,94 @@ export class TransactionManager {
     );
   }
 
-  startTransaction(vcp: VCP, startTransactionProps: StartTransactionProps) {
+  startTransaction(
+    vcp: VCP,
+    transactionId: number,
+    connectorId: number,
+    idTag: string,
+  ) {
+    const startTime = new Date();
+    const transactionState: TransactionState = {
+      transactionId: transactionId,
+      idTag: idTag,
+      accumulatedEnergyWh: 0,
+      startedAt: startTime,
+      connectorId: connectorId,
+      lastUpdateTime: startTime,
+    };
+
     const meterValuesTimer = setInterval(() => {
-      // biome-ignore lint/style/noNonNullAssertion: transaction must exist
-      const currentTransactionState = this.transactions.get(
-        startTransactionProps.transactionId,
-      )!;
-      const { meterValuesTimer, ...currentTransaction } =
-        currentTransactionState;
-      startTransactionProps.meterValuesCallback({
-        ...currentTransaction,
-        meterValue: this.getMeterValue(startTransactionProps.transactionId),
-      });
+      const currentTimestamp = new Date();
+      const timeDiffHours =
+        (currentTimestamp.getTime() - transactionState.lastUpdateTime.getTime()) /
+        (1000 * 60 * 60);
+
+      const powerLimit = chargingProfileManager.getPowerLimit(
+        connectorId,
+        transactionId,
+        currentTimestamp,
+      );
+
+      let powerInWatts: number;
+      if (powerLimit !== null) {
+        powerInWatts = powerLimit;
+      } else {
+        powerInWatts = DEFAULT_POWER_WATTS;
+      }
+
+      if (powerInWatts > 0 && timeDiffHours > 0) {
+        const energyIncrementWh = powerInWatts * timeDiffHours;
+        transactionState.accumulatedEnergyWh += energyIncrementWh;
+      }
+
+      const currentEnergyKwh = transactionState.accumulatedEnergyWh / 1000;
+
+      vcp.send(
+        meterValuesOcppMessage.request({
+          connectorId: connectorId,
+          transactionId: transactionId,
+          meterValue: [
+            {
+              timestamp: currentTimestamp.toISOString(),
+              sampledValue: [
+                {
+                  value: powerInWatts.toString(),
+                  measurand: "Power.Active.Import",
+                  unit: "W",
+                },
+                {
+                  value: currentEnergyKwh.toString(),
+                  measurand: "Energy.Active.Import.Register",
+                  unit: "kWh",
+                },
+              ],
+            },
+          ],
+        }),
+      );
+
+      transactionState.lastUpdateTime = currentTimestamp;
     }, METER_VALUES_INTERVAL_SEC * 1000);
-    this.transactions.set(startTransactionProps.transactionId, {
-      transactionId: startTransactionProps.transactionId,
-      idTag: startTransactionProps.idTag,
-      meterValue: 0,
-      startedAt: new Date(),
-      evseId: startTransactionProps.evseId,
-      connectorId: startTransactionProps.connectorId,
-      meterValuesTimer: meterValuesTimer,
-    });
+
+    transactionState.meterValuesTimer = meterValuesTimer;
+    this.transactions.set(transactionId.toString(), transactionState);
   }
 
-  stopTransaction(transactionId: TransactionId) {
-    const transaction = this.transactions.get(transactionId);
+  stopTransaction(transactionId: number) {
+    const transaction = this.transactions.get(transactionId.toString());
     if (transaction?.meterValuesTimer) {
       clearInterval(transaction.meterValuesTimer);
     }
-    this.transactions.delete(transactionId);
+    this.transactions.delete(transactionId.toString());
   }
 
-  getMeterValue(transactionId: TransactionId) {
-    const transaction = this.transactions.get(transactionId);
+  getMeterValue(transactionId: number) {
+    const transaction = this.transactions.get(transactionId.toString());
     if (!transaction) {
       return 0;
     }
-    return (new Date().getTime() - transaction.startedAt.getTime()) / 100;
+    return transaction.accumulatedEnergyWh;
   }
 }
+
+export const transactionManager = new TransactionManager();
