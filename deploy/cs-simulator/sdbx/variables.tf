@@ -17,7 +17,8 @@ variable "cp_ws_list" {
     ws_url = string
   }))
   default = [
-    { cp_id = "FR*ORV*A0014", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
+    # { cp_id = "FR*ORV*A0014", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
+    { cp_id = "FR*ORV*ROO10", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
     { cp_id = "FR*ORV*A0015", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
     #{ cp_id = "FR*ORV*A0016", ws_url = "wss://proxy.ocpp-proxy.prod.oreve.com" },
     #{ cp_id = "FR*ORV*A0017", ws_url = "wss://proxy.ocpp-proxy.prod.oreve.com" },
