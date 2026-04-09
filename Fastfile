@@ -130,7 +130,7 @@ goal app:
         - env "sdbx" [*ENVIRONMENTS] !
         do terraform:prepare
         sh.bind("hashicorp/terraform:latest/bin/ash?v=aws:/root/.aws&it=false&timeout=600")
-        sh: terraform -chdir=deploy/${name}/${env} init
+        sh: terraform -chdir=deploy/${name}/${env} init -upgrade
         goal plan:sh:
             terraform -chdir=deploy/${name}/${env} plan -var="app_task_container_image=${full_image_name}"
 
