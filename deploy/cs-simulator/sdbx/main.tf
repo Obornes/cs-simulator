@@ -1,7 +1,7 @@
 locals {
   cp_instances = {
     for idx, cp in var.cp_ws_list :
-    replace(replace(cp.cp_id, "*", "-"), "/", "-") => cp  # removed -${idx}
+    coalesce(cp.name, replace(replace(cp.cp_id, "*", "-"), "/", "-")) => cp
   }
 }
 
