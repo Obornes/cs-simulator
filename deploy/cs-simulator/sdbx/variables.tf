@@ -15,15 +15,16 @@ variable "cp_ws_list" {
   type = list(object({
     cp_id  = string
     ws_url = string
+    name   = optional(string)
   }))
   default = [
     { cp_id = "FR*ORV*ROO10", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
     { cp_id = "FR*ORV*A0015", ws_url = "wss://server.16.ocpp.stg.oreve.com" },
     { cp_id = "FR*ORV*A0016", ws_url = "wss://ocpp.oreve.com" },
-    { cp_id = "CS*SIMULATOR*1", ws_url = "wss://cpc.eu-stable.uat.charge.ampeco.tech/obornes/CS%2ASIMULATOR%2A1" }, # AMPECO demande Luca
+    { cp_id = "CS*SIMULATOR*1", ws_url = "wss://cpc.eu-stable.uat.charge.ampeco.tech/obornes/CS%2ASIMULATOR%2A1" },
     { cp_id = "FR*ORV*B0201", ws_url = "wss://proxy.ocpp-proxy.test.oreve.com" },
-    { cp_id = "FR*ONCE*B8891", ws_url = "wss://server.16.ocpp.stg.oreve.com" },
-    { cp_id = "FR*ONCE*B8890", ws_url = "wss://server.16.ocpp.stg.oreve.com" },
+    { cp_id = "FR*ONCE*B8890", ws_url = "wss://server.16.ocpp.stg.oreve.com", name = "FR-ONC-B8890" },
+    { cp_id = "FR*ONCE*B8891", ws_url = "wss://server.16.ocpp.stg.oreve.com", name = "FR-ONC-B8891" },
     { cp_id = "FR*ONCE*A0014", ws_url = "wss://server.16.ocpp.stg.oreve.com" },
   ]
 }

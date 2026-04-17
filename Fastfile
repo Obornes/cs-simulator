@@ -9,7 +9,7 @@ requires:
     package "https://github.com/Obornes/fast-packages.git#/libs/obornes-commons"
 
 name = "cs-simulator"
-version = "1.1.16"
+version = "1.1.17"
 CLOUD_WS_URL = "wss://cpc.eu-stable.uat.charge.ampeco.tech:443/obornes"
 CP_PASSWORD =  ""
 CP_ID = "CS*SIMULATOR*1"
@@ -25,7 +25,6 @@ image_name = DOCKER_REGISTRY + "/" + name
 hash_git = sh: git rev-parse --short HEAD
 full_image_name       = image_name + ":git-" + version + "-" + hash_git
 release_image_name    = image_name + ":v" + version
-
 
 
 goal dockerize:
@@ -46,11 +45,13 @@ function run(cmd):
     sh: docker exec -t ${name} npx tsx admin/v16/${cmd}
 
 
+# Terraform management
 goal terraform:
     goal prepare:sh:
         rm -rf tf-modules
         mkdir -p tf-modules
-        gh repo clone "https://github.com/Obornes/terraform-modules.git" tf-modules/terraform-modules || true
+        gh repo clone "https://github.com/Obornes/terraform-modules.git" tf-modules/terraform-modules -- --branch v2.1.02 || true
+
 
 
 goal github:
