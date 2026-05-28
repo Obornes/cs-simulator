@@ -43,7 +43,7 @@ export class VCP {
   private ws?: WebSocket;
   private messageHandler: OcppMessageHandler;
 
-  private isFinishing = false;
+  public isFinishing = false;
 
   transactionManager = new TransactionManager();
 
@@ -74,7 +74,7 @@ export class VCP {
     }
   }
 
-  async connect(): Promise<void> {
+  async connect(reconnect?: () => void): Promise<void> {
     logger.info(`Connecting... | ${util.inspect(this.vcpOptions)}`);
     this.isFinishing = false;
     return new Promise((resolve) => {
@@ -101,8 +101,18 @@ export class VCP {
         logger.info("Received PONG");
       });
       this.ws.on("close", (code: number, reason: string) =>
-        this._onClose(code, reason),
+        this._onClose(code, reason, reconnect),
       );
+      this.ws.on("error", (error: any) => {
+        logger.error(`Error on websocket`, error);
+        setTimeout(() => {
+          if (reconnect) {
+            reconnect();
+          } else {
+            process.exit();
+          }
+        }, 1000);
+      });
     });
   }
 
@@ -258,11 +268,16 @@ export class VCP {
     }
   }
 
-  private _onClose(code: number, reason: string) {
+  private _onClose(code: number, reason: string, reconnect?: () => void) {
     if (this.isFinishing) {
       return;
     }
+    this.isFinishing = true;
     logger.info(`Connection closed. code=${code}, reason=${reason}`);
-    process.exit();
+    if (reconnect) {
+      reconnect();
+    } else {
+      process.exit();
+    }
   }
 }

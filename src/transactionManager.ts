@@ -22,9 +22,11 @@ interface StartTransactionProps {
 }
 
 export class TransactionManager {
+  static START_INTERVAL = true;
+
   transactions: Map<
     TransactionId,
-    TransactionState & { meterValuesTimer: NodeJS.Timer }
+    TransactionState & { meterValuesTimer: NodeJS.Timer | null }
   > = new Map();
 
   canStartNewTransaction(connectorId: number) {
@@ -34,7 +36,7 @@ export class TransactionManager {
   }
 
   startTransaction(vcp: VCP, startTransactionProps: StartTransactionProps) {
-    const meterValuesTimer = setInterval(() => {
+    const meterValuesTimer = TransactionManager.START_INTERVAL ? setInterval(() => {
       // biome-ignore lint/style/noNonNullAssertion: transaction must exist
       const currentTransactionState = this.transactions.get(
         startTransactionProps.transactionId,
@@ -45,7 +47,7 @@ export class TransactionManager {
         ...currentTransaction,
         meterValue: this.getMeterValue(startTransactionProps.transactionId),
       });
-    }, METER_VALUES_INTERVAL_SEC * 1000);
+    }, METER_VALUES_INTERVAL_SEC * 1000) : null;
     this.transactions.set(startTransactionProps.transactionId, {
       transactionId: startTransactionProps.transactionId,
       idTag: startTransactionProps.idTag,

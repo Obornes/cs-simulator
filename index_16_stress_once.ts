@@ -1,6 +1,9 @@
 require("dotenv").config();
 
+import * as uuid from "uuid";
+
 import { OcppVersion } from "./src/ocppVersion";
+import { TransactionManager } from "./src/transactionManager";
 import { bootNotificationOcppMessage } from "./src/v16/messages/bootNotification";
 import { startTransactionOcppMessage } from "./src/v16/messages/startTransaction";
 import { stopTransactionOcppMessage } from "./src/v16/messages/stopTransaction";
@@ -58,6 +61,8 @@ async function waitForTransactionId(
 }
 
 (async () => {
+  TransactionManager.START_INTERVAL = false;
+
   const chargePointsCount = Number.parseInt(process.env.CP_COUNT ?? "10");
   const chargePointIdPrefix = process.env.ID_PREFIX ?? "CS_2_";
   const rfidTag = process.env.RFID_TAG ?? "TEST";
@@ -66,40 +71,74 @@ async function waitForTransactionId(
   const pollMs = Number.parseInt(process.env.POLL_MS ?? "500");
   const pollTimeout = Number.parseInt(process.env.POLL_TIMEOUT ?? "30000");
   const sharedPassword = process.env.PASSWORD ?? undefined;
-  const autoStop = durationMs > 0;
 
   console.log(
     `Starting stress test: ${chargePointsCount} VCPs, prefix="${chargePointIdPrefix}", ` +
-    `idTag="${rfidTag}", duration=${autoStop ? `${durationMs}ms` : "manual (Ctrl+C to stop)"}`,
+    `idTag="${rfidTag}", duration=${durationMs}ms`,
   );
 
   for (let i = 1; i <= chargePointsCount; i++) {
-    const chargePointId = `${chargePointIdPrefix}${i}`;
-    const password = sharedPassword ?? `ocpp_password_${chargePointId.replace(/\*/g, "_")}`;
+    const chargePointId = `${chargePointIdPrefix}${String(i).padStart(4, "0")}`;
 
-    let sessionStartedRes: (value?: unknown) => void;
-    const sessionStarted = new Promise((res) => {
-      sessionStartedRes = res;
-    });
-
-    const vcp = new VCP({
-      endpoint: process.env.WS_URL ?? "ws://localhost:5555",
+    await connectToVCP({
       chargePointId,
-      ocppVersion: OcppVersion.OCPP_1_6,
-      basicAuthPassword: password,
-    });
+      pollMs,
+      pollTimeout,
+      durationMs,
+      sharedPassword,
+      rfidTag,
+    })
 
-    vcp.connect().then(async () => {
-      // 1 — BootNotification
-      vcp.send(
-        bootNotificationOcppMessage.request({
-          chargePointVendor: "Solidstudio",
-          chargePointModel: "VirtualChargePoint",
-          chargePointSerialNumber: "S001",
-          firmwareVersion: "1.0.0",
-        }),
-      );
+    await new Promise((r) => setTimeout(r, staggerMs));
+  }
 
+  const totalWaitMs = chargePointsCount * staggerMs + pollTimeout + durationMs * 1.2 + 60_000;
+  console.log(
+    `All VCPs started. Process will exit in ~${Math.ceil(totalWaitMs / 1000)}s ` +
+    `once all sessions complete.`,
+  );
+  await new Promise((r) => setTimeout(r, totalWaitMs));
+  console.log("✓ All StopTransactions sent. Exiting.");
+  process.exit(0);
+})();
+
+async function connectToVCP({ chargePointId, pollMs, pollTimeout, durationMs, sharedPassword, rfidTag, transactionId = null, sessionStartedAt = null }: {
+  chargePointId: string;
+  pollMs: number;
+  pollTimeout: number;
+  durationMs: number;
+  sharedPassword: string | undefined;
+  rfidTag: string;
+  transactionId?: string | number | null;
+  sessionStartedAt?: Date | null;
+}) {
+  let sessionStartedRes: (value?: unknown) => void;
+  const sessionStarted = new Promise((res) => {
+    sessionStartedRes = res;
+  });
+
+  const password = sharedPassword ?? `ocpp_password_${chargePointId.replace(/\*/g, "_")}`;
+  const vcp = new VCP({
+    endpoint: process.env.WS_URL ?? "ws://localhost:5555",
+    chargePointId,
+    ocppVersion: OcppVersion.OCPP_1_6,
+    basicAuthPassword: password,
+  });
+  vcp.connect(() => {
+    console.warn(`${chargePointId} disconnected, reconnecting...`);
+    connectToVCP({ chargePointId, pollMs, pollTimeout, durationMs, sharedPassword, rfidTag, transactionId, sessionStartedAt });
+  }).then(async () => {
+    // 1 — BootNotification
+    vcp.send(
+      bootNotificationOcppMessage.request({
+        chargePointVendor: "Solidstudio",
+        chargePointModel: "VirtualChargePoint",
+        chargePointSerialNumber: "S001",
+        firmwareVersion: "1.0.0",
+      }),
+    );
+
+    if (transactionId === null) {
       // 2 — StartTransaction
       const meterStart = 0;
       vcp.send(
@@ -111,65 +150,86 @@ async function waitForTransactionId(
         }),
       );
 
-      if (!autoStop) return;
-
       // 3 — Wait for transactionId to appear in transactionManager
       // (populated by startTransaction resHandler once ONCE responds)
-      const transactionId = await waitForTransactionId(vcp, 1, pollMs, pollTimeout);
-
-      // Unblock outer loop so next VCP can start staggering — independent of StopTransaction.
-      sessionStartedRes();
-
-      if (transactionId === null) {
-        console.warn(
-          `[${chargePointId}] ⚠️  No transactionId after ${pollTimeout}ms — ` +
-          `StartTransaction may have been rejected (check RFID allowlist). Skipping StopTransaction.`,
-        );
-        return;
-      }
+      transactionId = await waitForTransactionId(vcp, 1, pollMs, pollTimeout);
+      sessionStartedAt = new Date();
 
       console.log(
         `[${chargePointId}] ✓ Session started (transactionId=${transactionId}). ` +
         `Will stop in ${durationMs}ms.`,
       );
+    }
 
-      // 4 — Wait for session duration
-      await new Promise((r) => setTimeout(r, durationMs));
+    // Unblock outer loop so next VCP can start staggering — independent of StopTransaction.
+    sessionStartedRes();
 
-      // 5 — StopTransaction
-      const meterStop = vcp.transactionManager.getMeterValue(transactionId);
-      console.log(
-        `[${chargePointId}] Sending StopTransaction (transactionId=${transactionId}, meterStop=${meterStop})`,
+    if (transactionId === null) {
+      console.warn(
+        `[${chargePointId}] ⚠️  No transactionId after ${pollTimeout}ms — ` +
+        `StartTransaction may have been rejected (check RFID allowlist). Skipping StopTransaction.`,
       );
-      vcp.send(
-        stopTransactionOcppMessage.request({
-          transactionId: transactionId as number,
-          idTag: rfidTag,
-          meterStop: Math.round(meterStop),
-          timestamp: new Date().toISOString(),
-          reason: "Local",
-        }),
-      );
-    });
+      return;
+    }
+    if (!sessionStartedAt) {
+      return;
+    }
 
+    // 4 — Send MeterValues every 30s until sessionStartedAt + durationMs
+    const METER_INTERVAL_MS = 10_000;
+    const deadline = sessionStartedAt.getTime() + durationMs;
+    while (Date.now() < deadline) {
+      const waitMs = Math.min(METER_INTERVAL_MS, deadline - Date.now());
+      await new Promise((r) => setTimeout(r, waitMs));
+      if (Date.now() >= deadline) break;
+      if (vcp.isFinishing) {
+        return;
+      }
+      vcp.send({
+        messageId: uuid.v4(),
+        action: 'MeterValues',
+        payload: {
+          connectorId: 1,
+          transactionId,
+          meterValue: [
+            {
+              timestamp: new Date(),
+              sampledValue: [
+                {
+                  value: ((new Date().getTime() - sessionStartedAt.getTime()) / 100).toString(),
+                  measurand: 'Energy.Active.Import.Register',
+                  unit: 'Wh',
+                },
+              ],
+            },
+          ],
+        },
+      });
+    }
+
+    if (vcp.isFinishing) {
+      return;
+    }
+    const meterStop = sessionStartedAt ? (new Date().getTime() - sessionStartedAt.getTime()) / 100 : 0;
+    console.log(
+      `[${chargePointId}] Sending StopTransaction (transactionId=${transactionId}, meterStop=${meterStop})`,
+    );
+    vcp.send(
+      stopTransactionOcppMessage.request({
+        transactionId: transactionId as number,
+        idTag: rfidTag,
+        meterStop: Math.round(meterStop),
+        timestamp: new Date().toISOString(),
+        reason: "Local",
+      }),
+    );
+  });
+
+  if (transactionId === null) {
     // Gate the next VCP on this one's StartTransaction completing, so transactionIds
     // are assigned in order and the stagger delay starts from a stable baseline.
     console.log(`[${chargePointId}] Waiting for session to start...`);
     await sessionStarted;
-
-    await new Promise((r) => setTimeout(r, staggerMs));
   }
+}
 
-  if (autoStop) {
-    // Total wait: ramp-up + poll timeout + session duration + 15s buffer for StopTransaction responses
-    const totalWaitMs =
-      chargePointsCount * staggerMs + pollTimeout + durationMs + 15_000;
-    console.log(
-      `All VCPs started. Process will exit in ~${Math.ceil(totalWaitMs / 1000)}s ` +
-      `once all sessions complete.`,
-    );
-    await new Promise((r) => setTimeout(r, totalWaitMs));
-    console.log("✓ All StopTransactions sent. Exiting.");
-    process.exit(0);
-  }
-})();
