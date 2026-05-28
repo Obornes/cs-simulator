@@ -77,6 +77,11 @@ async function waitForTransactionId(
     const chargePointId = `${chargePointIdPrefix}${i}`;
     const password = sharedPassword ?? `ocpp_password_${chargePointId.replace(/\*/g, "_")}`;
 
+    let sessionStartedRes: (value?: unknown) => void;
+    const sessionStarted = new Promise((res) => {
+      sessionStartedRes = res;
+    });
+
     const vcp = new VCP({
       endpoint: process.env.WS_URL ?? "ws://localhost:5555",
       chargePointId,
@@ -112,6 +117,9 @@ async function waitForTransactionId(
       // (populated by startTransaction resHandler once ONCE responds)
       const transactionId = await waitForTransactionId(vcp, 1, pollMs, pollTimeout);
 
+      // Unblock outer loop so next VCP can start staggering — independent of StopTransaction.
+      sessionStartedRes();
+
       if (transactionId === null) {
         console.warn(
           `[${chargePointId}] ⚠️  No transactionId after ${pollTimeout}ms — ` +
@@ -143,6 +151,11 @@ async function waitForTransactionId(
         }),
       );
     });
+
+    // Gate the next VCP on this one's StartTransaction completing, so transactionIds
+    // are assigned in order and the stagger delay starts from a stable baseline.
+    console.log(`[${chargePointId}] Waiting for session to start...`);
+    await sessionStarted;
 
     await new Promise((r) => setTimeout(r, staggerMs));
   }
