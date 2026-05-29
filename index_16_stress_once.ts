@@ -175,7 +175,7 @@ async function connectToVCP({ chargePointId, pollMs, pollTimeout, durationMs, sh
       return;
     }
 
-    // 4 — Send MeterValues every 30s until sessionStartedAt + durationMs
+    // 4 — Send MeterValues every 10s until sessionStartedAt + durationMs
     const METER_INTERVAL_MS = 10_000;
     const deadline = sessionStartedAt.getTime() + durationMs;
     while (Date.now() < deadline) {
