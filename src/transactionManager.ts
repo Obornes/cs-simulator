@@ -4,7 +4,7 @@ const METER_VALUES_INTERVAL_SEC = 15;
 
 type TransactionId = string | number;
 
-interface TransactionState {
+export interface TransactionState {
   startedAt: Date;
   idTag: string;
   transactionId: TransactionId;
@@ -22,9 +22,11 @@ interface StartTransactionProps {
 }
 
 export class TransactionManager {
+  static START_INTERVAL = true;
+
   transactions: Map<
     TransactionId,
-    TransactionState & { meterValuesTimer: NodeJS.Timer }
+    TransactionState & { meterValuesTimer: ReturnType<typeof setInterval> | null }
   > = new Map();
 
   canStartNewTransaction(connectorId: number) {
@@ -33,19 +35,27 @@ export class TransactionManager {
     );
   }
 
-  startTransaction(vcp: VCP, startTransactionProps: StartTransactionProps) {
-    const meterValuesTimer = setInterval(() => {
-      // biome-ignore lint/style/noNonNullAssertion: transaction must exist
-      const currentTransactionState = this.transactions.get(
-        startTransactionProps.transactionId,
-      )!;
-      const { meterValuesTimer, ...currentTransaction } =
-        currentTransactionState;
-      startTransactionProps.meterValuesCallback({
-        ...currentTransaction,
-        meterValue: this.getMeterValue(startTransactionProps.transactionId),
-      });
-    }, METER_VALUES_INTERVAL_SEC * 1000);
+  startTransaction(_vcp: VCP, startTransactionProps: StartTransactionProps) {
+    const meterValuesTimer = TransactionManager.START_INTERVAL
+      ? setInterval(() => {
+          const currentTransactionState = this.transactions.get(
+            startTransactionProps.transactionId,
+          );
+
+          if (!currentTransactionState) {
+            return;
+          }
+
+          const { meterValuesTimer: _timer, ...currentTransaction } =
+            currentTransactionState;
+
+          startTransactionProps.meterValuesCallback({
+            ...currentTransaction,
+            meterValue: this.getMeterValue(startTransactionProps.transactionId),
+          });
+        }, METER_VALUES_INTERVAL_SEC * 1000)
+      : null;
+
     this.transactions.set(startTransactionProps.transactionId, {
       transactionId: startTransactionProps.transactionId,
       idTag: startTransactionProps.idTag,
@@ -53,23 +63,60 @@ export class TransactionManager {
       startedAt: new Date(),
       evseId: startTransactionProps.evseId,
       connectorId: startTransactionProps.connectorId,
-      meterValuesTimer: meterValuesTimer,
+      meterValuesTimer,
+    });
+  }
+
+  restoreTransaction(transactionState: TransactionState) {
+    const existing = this.transactions.get(transactionState.transactionId);
+
+    if (existing?.meterValuesTimer) {
+      clearInterval(existing.meterValuesTimer);
+    }
+
+    this.transactions.set(transactionState.transactionId, {
+      ...transactionState,
+      meterValuesTimer: null,
     });
   }
 
   stopTransaction(transactionId: TransactionId) {
     const transaction = this.transactions.get(transactionId);
+
     if (transaction?.meterValuesTimer) {
       clearInterval(transaction.meterValuesTimer);
     }
+
     this.transactions.delete(transactionId);
+  }
+
+  stopAllTransactions() {
+    for (const transaction of this.transactions.values()) {
+      if (transaction.meterValuesTimer) {
+        clearInterval(transaction.meterValuesTimer);
+      }
+    }
+
+    this.transactions.clear();
+  }
+
+  getTransactionByConnector(connectorId: number) {
+    return Array.from(this.transactions.values()).find(
+      (transaction) => transaction.connectorId === connectorId,
+    );
+  }
+
+  hasTransaction(transactionId: TransactionId) {
+    return this.transactions.has(transactionId);
   }
 
   getMeterValue(transactionId: TransactionId) {
     const transaction = this.transactions.get(transactionId);
+
     if (!transaction) {
       return 0;
     }
+
     return (new Date().getTime() - transaction.startedAt.getTime()) / 100;
   }
 }

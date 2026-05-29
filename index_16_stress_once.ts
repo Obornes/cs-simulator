@@ -4,38 +4,64 @@ dotenv.config({
   path: process.env.DOTENV_CONFIG_PATH ?? ".env.stress",
 });
 
+import * as uuid from "uuid";
+
 import { OcppVersion } from "./src/ocppVersion";
+import { TransactionManager } from "./src/transactionManager";
 import { bootNotificationOcppMessage } from "./src/v16/messages/bootNotification";
 import { startTransactionOcppMessage } from "./src/v16/messages/startTransaction";
 import { stopTransactionOcppMessage } from "./src/v16/messages/stopTransaction";
-import { VCP } from "./src/vcp";
+import { VCP, type VCPDisconnectInfo } from "./src/vcp";
 
-/**
- * SYS-739 — Stress test script for ONCE / OREVE platform.
- *
- * Each VCP:
- *   1. Connects via WebSocket
- *   2. Sends BootNotification
- *   3. Sends StartTransaction
- *   4. Waits for transactionId
- *   5. Waits DURATION_MS
- *   6. Sends StopTransaction
- *   7. Script exits only after all VCP tasks are completed
- *
- * Env vars:
- *   WS_URL          WebSocket endpoint
- *   CP_COUNT        Number of VCPs to launch
- *   ID_PREFIX       Charge point ID base prefix, example: FR*ORV*CS
- *   ID_WIDTH        Numeric suffix width, example: 4 => 0001, 0010
- *   PASSWORD        Optional shared password
- *   RFID_TAG        RFID token
- *   STAGGER_MS      Delay between VCP launches
- *   START_DELAY_MS  Delay between BootNotification and StartTransaction
- *   DURATION_MS     Session duration before StopTransaction
- *   POLL_MS         Polling interval for transactionId
- *   POLL_TIMEOUT    Max wait time for transactionId
- *   STOP_SETTLE_MS  Small delay after StopTransaction before completing task
- */
+type TransactionId = string | number;
+
+interface StressConfig {
+  endpoint: string;
+  chargePointsCount: number;
+  chargePointIdPrefix: string;
+  idWidth: number;
+  rfidTag: string;
+  staggerMs: number;
+  startDelayMs: number;
+  durationMs: number;
+  pollMs: number;
+  pollTimeout: number;
+  meterIntervalMs: number;
+  stopSettleMs: number;
+  sharedPassword?: string;
+  reconnectEnabled: boolean;
+  maxReconnectAttempts: number;
+  reconnectDelayMs: number;
+  reconnectBackoffFactor: number;
+  reconnectMaxDelayMs: number;
+}
+
+interface VcpSessionState {
+  chargePointId: string;
+  password: string;
+  transactionId: TransactionId | null;
+  sessionStartedAt: Date | null;
+  startTransactionSent: boolean;
+  completed: boolean;
+  reconnectAttempts: number;
+}
+
+class ReconnectRequired extends Error {
+  constructor(
+    message: string,
+    public readonly disconnectInfo?: VCPDisconnectInfo,
+  ) {
+    super(message);
+    this.name = "ReconnectRequired";
+  }
+}
+
+class NonRetryableSessionError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NonRetryableSessionError";
+  }
+}
 
 function parseNumberEnv(name: string, defaultValue: number): number {
   const raw = process.env[name];
@@ -56,6 +82,16 @@ function parseNumberEnv(name: string, defaultValue: number): number {
   return parsed;
 }
 
+function parseBooleanEnv(name: string, defaultValue: boolean): boolean {
+  const raw = process.env[name];
+
+  if (raw === undefined || raw.trim() === "") {
+    return defaultValue;
+  }
+
+  return ["true", "1", "yes", "y"].includes(raw.toLowerCase());
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -72,73 +108,108 @@ function buildPassword(chargePointId: string, sharedPassword?: string): string {
   return `ocpp_password_${chargePointId.replace(/\*/g, "_")}`;
 }
 
-/**
- * Wait until transactionManager has a transaction for connectorId,
- * then return its transactionId.
- *
- * Returns null if timeout is reached.
- */
+function loadConfig(): StressConfig {
+  return {
+    endpoint: process.env.WS_URL ?? "ws://localhost:5555",
+    chargePointsCount: parseNumberEnv("CP_COUNT", 10),
+    chargePointIdPrefix: process.env.ID_PREFIX ?? "CS_2_",
+    idWidth: parseNumberEnv("ID_WIDTH", 4),
+    rfidTag: process.env.RFID_TAG ?? "TEST",
+    staggerMs: parseNumberEnv("STAGGER_MS", 3000),
+    startDelayMs: parseNumberEnv("START_DELAY_MS", 1000),
+    durationMs: parseNumberEnv("DURATION_MS", 300000),
+    pollMs: parseNumberEnv("POLL_MS", 500),
+    pollTimeout: parseNumberEnv("POLL_TIMEOUT", 30000),
+    meterIntervalMs: parseNumberEnv("METER_INTERVAL_MS", 10000),
+    stopSettleMs: parseNumberEnv("STOP_SETTLE_MS", 3000),
+    sharedPassword: process.env.PASSWORD || undefined,
+    reconnectEnabled: parseBooleanEnv("RECONNECT_ENABLED", true),
+    maxReconnectAttempts: parseNumberEnv("MAX_RECONNECT_ATTEMPTS", 5),
+    reconnectDelayMs: parseNumberEnv("RECONNECT_DELAY_MS", 5000),
+    reconnectBackoffFactor: parseNumberEnv("RECONNECT_BACKOFF_FACTOR", 2),
+    reconnectMaxDelayMs: parseNumberEnv("RECONNECT_MAX_DELAY_MS", 60000),
+  };
+}
+
+function createDisconnectSignal() {
+  let disconnected = false;
+  let disconnectInfo: VCPDisconnectInfo | undefined;
+  let resolvePromise: (info: VCPDisconnectInfo) => void = () => {};
+
+  const promise = new Promise<VCPDisconnectInfo>((resolve) => {
+    resolvePromise = resolve;
+  });
+
+  return {
+    promise,
+    notify(info: VCPDisconnectInfo) {
+      if (disconnected) {
+        return;
+      }
+
+      disconnected = true;
+      disconnectInfo = info;
+      resolvePromise(info);
+    },
+    isDisconnected() {
+      return disconnected;
+    },
+    info() {
+      return disconnectInfo;
+    },
+  };
+}
+
+async function sleepOrDisconnect(
+  ms: number,
+  disconnectSignal: ReturnType<typeof createDisconnectSignal>,
+): Promise<"timeout" | "disconnected"> {
+  const result = await Promise.race([
+    sleep(ms).then(() => "timeout" as const),
+    disconnectSignal.promise.then(() => "disconnected" as const),
+  ]);
+
+  return result;
+}
+
 async function waitForTransactionId(
   vcp: VCP,
   connectorId: number,
   pollMs: number,
   timeoutMs: number,
-): Promise<string | number | null> {
+  disconnectSignal: ReturnType<typeof createDisconnectSignal>,
+): Promise<TransactionId | null> {
   const deadline = Date.now() + timeoutMs;
 
   while (Date.now() < deadline) {
-    const match = Array.from(vcp.transactionManager.transactions.values()).find(
-      (transaction) => transaction.connectorId === connectorId,
-    );
+    if (disconnectSignal.isDisconnected()) {
+      throw new ReconnectRequired(
+        "Disconnected while waiting for StartTransaction response",
+        disconnectSignal.info(),
+      );
+    }
+
+    const match = vcp.transactionManager.getTransactionByConnector(connectorId);
 
     if (match) {
       return match.transactionId;
     }
 
-    await sleep(pollMs);
+    const waitMs = Math.min(pollMs, deadline - Date.now());
+    const waitResult = await sleepOrDisconnect(waitMs, disconnectSignal);
+
+    if (waitResult === "disconnected") {
+      throw new ReconnectRequired(
+        "Disconnected while waiting for StartTransaction response",
+        disconnectSignal.info(),
+      );
+    }
   }
 
   return null;
 }
 
-async function runVcp(params: {
-  chargePointId: string;
-  password: string;
-  endpoint: string;
-  rfidTag: string;
-  durationMs: number;
-  pollMs: number;
-  pollTimeout: number;
-  startDelayMs: number;
-  stopSettleMs: number;
-}): Promise<void> {
-  const {
-    chargePointId,
-    password,
-    endpoint,
-    rfidTag,
-    durationMs,
-    pollMs,
-    pollTimeout,
-    startDelayMs,
-    stopSettleMs,
-  } = params;
-
-  const autoStop = durationMs > 0;
-
-  const vcp = new VCP({
-    endpoint,
-    chargePointId,
-    ocppVersion: OcppVersion.OCPP_1_6,
-    basicAuthPassword: password,
-  });
-
-  console.log(`[${chargePointId}] Connecting to ${endpoint}`);
-
-  await vcp.connect();
-
-  console.log(`[${chargePointId}] Connected. Sending BootNotification`);
-
+function sendBootNotification(vcp: VCP, chargePointId: string) {
   vcp.send(
     bootNotificationOcppMessage.request({
       chargePointVendor: "Solidstudio",
@@ -147,167 +218,362 @@ async function runVcp(params: {
       firmwareVersion: "1.0.0",
     }),
   );
+}
 
-  if (startDelayMs > 0) {
-    console.log(
-      `[${chargePointId}] Waiting ${startDelayMs}ms before StartTransaction`,
-    );
-    await sleep(startDelayMs);
-  }
-
-  console.log(`[${chargePointId}] Sending StartTransaction`);
-
-  vcp.send(
-    startTransactionOcppMessage.request({
+function sendChargingStatusNotification(vcp: VCP) {
+  vcp.send({
+    messageId: uuid.v4(),
+    action: "StatusNotification",
+    payload: {
       connectorId: 1,
-      idTag: rfidTag,
-      meterStart: 0,
+      errorCode: "NoError",
+      status: "Charging",
       timestamp: new Date().toISOString(),
-    }),
-  );
+    },
+  });
+}
 
-  const transactionId = await waitForTransactionId(vcp, 1, pollMs, pollTimeout);
+function sendMeterValues(
+  vcp: VCP,
+  transactionId: TransactionId,
+  sessionStartedAt: Date,
+) {
+  const meterValue = (Date.now() - sessionStartedAt.getTime()) / 100;
 
-  if (transactionId === null) {
+  vcp.send({
+    messageId: uuid.v4(),
+    action: "MeterValues",
+    payload: {
+      connectorId: 1,
+      transactionId,
+      meterValue: [
+        {
+          timestamp: new Date().toISOString(),
+          sampledValue: [
+            {
+              value: meterValue.toString(),
+              measurand: "Energy.Active.Import.Register",
+              unit: "Wh",
+            },
+          ],
+        },
+      ],
+    },
+  });
+}
+
+function calculateReconnectDelay(config: StressConfig, attempt: number): number {
+  const delay =
+    config.reconnectDelayMs *
+    Math.pow(config.reconnectBackoffFactor, Math.max(0, attempt - 1));
+
+  return Math.min(delay, config.reconnectMaxDelayMs);
+}
+
+async function runConnectedSessionAttempt(
+  config: StressConfig,
+  state: VcpSessionState,
+): Promise<void> {
+  const disconnectSignal = createDisconnectSignal();
+
+  const vcp = new VCP({
+    endpoint: config.endpoint,
+    chargePointId: state.chargePointId,
+    ocppVersion: OcppVersion.OCPP_1_6,
+    basicAuthPassword: state.password,
+  });
+
+  await vcp.connect((info) => {
     console.warn(
-      `[${chargePointId}] No transactionId after ${pollTimeout}ms. ` +
-        `StartTransaction may have been rejected. Skipping StopTransaction.`,
+      `[${state.chargePointId}] Disconnected. source=${info.source}, code=${info.code}, reason=${info.reason}`,
     );
-    return;
+    disconnectSignal.notify(info);
+  });
+
+  console.log(`[${state.chargePointId}] Connected`);
+
+  sendBootNotification(vcp, state.chargePointId);
+
+  if (config.startDelayMs > 0) {
+    const waitResult = await sleepOrDisconnect(
+      config.startDelayMs,
+      disconnectSignal,
+    );
+
+    if (waitResult === "disconnected") {
+      throw new ReconnectRequired(
+        "Disconnected before StartTransaction",
+        disconnectSignal.info(),
+      );
+    }
   }
 
-  const numericTransactionId = Number(transactionId);
+  if (state.transactionId === null) {
+    console.log(`[${state.chargePointId}] Sending StartTransaction`);
 
-  if (Number.isNaN(numericTransactionId)) {
-    console.warn(
-      `[${chargePointId}] Invalid transactionId="${transactionId}". ` +
-        `Skipping StopTransaction.`,
+    state.startTransactionSent = true;
+
+    vcp.send(
+      startTransactionOcppMessage.request({
+        connectorId: 1,
+        idTag: config.rfidTag,
+        meterStart: 0,
+        timestamp: new Date().toISOString(),
+      }),
     );
-    return;
-  }
 
-  console.log(
-    `[${chargePointId}] Session started. transactionId=${numericTransactionId}`,
-  );
+    const transactionId = await waitForTransactionId(
+      vcp,
+      1,
+      config.pollMs,
+      config.pollTimeout,
+      disconnectSignal,
+    );
 
-  if (!autoStop) {
+    if (transactionId === null) {
+      throw new NonRetryableSessionError(
+        `[${state.chargePointId}] No transactionId after ${config.pollTimeout}ms. StartTransaction may have been rejected.`,
+      );
+    }
+
+    state.transactionId = transactionId;
+    state.sessionStartedAt = new Date();
+    state.reconnectAttempts = 0;
+
     console.log(
-      `[${chargePointId}] DURATION_MS=0, session will stay open until manual stop / Ctrl+C`,
+      `[${state.chargePointId}] Session started. transactionId=${state.transactionId}`,
     );
-    return;
+  } else {
+    console.log(
+      `[${state.chargePointId}] Reconnected with active transactionId=${state.transactionId}`,
+    );
+
+    if (state.sessionStartedAt) {
+      vcp.transactionManager.restoreTransaction({
+        transactionId: state.transactionId,
+        idTag: config.rfidTag,
+        meterValue: 0,
+        startedAt: state.sessionStartedAt,
+        connectorId: 1,
+      });
+    }
+
+    sendChargingStatusNotification(vcp);
   }
 
-  console.log(
-    `[${chargePointId}] Waiting ${durationMs}ms before StopTransaction`,
+  if (state.transactionId === null || state.sessionStartedAt === null) {
+    throw new NonRetryableSessionError(
+      `[${state.chargePointId}] Missing transaction state after StartTransaction`,
+    );
+  }
+
+  if (config.durationMs === 0) {
+    console.log(
+      `[${state.chargePointId}] DURATION_MS=0. Session will continue until Ctrl+C.`,
+    );
+
+    await disconnectSignal.promise;
+
+    throw new ReconnectRequired(
+      "Disconnected during manual long-running session",
+      disconnectSignal.info(),
+    );
+  }
+
+  const deadline = state.sessionStartedAt.getTime() + config.durationMs;
+
+  while (Date.now() < deadline) {
+    const waitMs = Math.min(config.meterIntervalMs, deadline - Date.now());
+
+    const waitResult = await sleepOrDisconnect(waitMs, disconnectSignal);
+
+    if (waitResult === "disconnected") {
+      throw new ReconnectRequired(
+        "Disconnected during active transaction",
+        disconnectSignal.info(),
+      );
+    }
+
+    if (Date.now() >= deadline) {
+      break;
+    }
+
+    sendMeterValues(vcp, state.transactionId, state.sessionStartedAt);
+  }
+
+  if (disconnectSignal.isDisconnected()) {
+    throw new ReconnectRequired(
+      "Disconnected before StopTransaction",
+      disconnectSignal.info(),
+    );
+  }
+
+  const meterStop = Math.round(
+    (Date.now() - state.sessionStartedAt.getTime()) / 100,
   );
 
-  await sleep(durationMs);
-
-  const meterStopRaw = vcp.transactionManager.getMeterValue(numericTransactionId);
-  const meterStop = Math.round(Number(meterStopRaw) || 0);
-
   console.log(
-    `[${chargePointId}] Sending StopTransaction. transactionId=${numericTransactionId}, meterStop=${meterStop}`,
+    `[${state.chargePointId}] Sending StopTransaction. transactionId=${state.transactionId}, meterStop=${meterStop}`,
   );
 
   vcp.send(
     stopTransactionOcppMessage.request({
-      transactionId: numericTransactionId,
-      idTag: rfidTag,
+      transactionId: Number(state.transactionId),
+      idTag: config.rfidTag,
       meterStop,
       timestamp: new Date().toISOString(),
       reason: "Local",
     }),
   );
 
-  if (stopSettleMs > 0) {
-    await sleep(stopSettleMs);
+  if (config.stopSettleMs > 0) {
+    const waitResult = await sleepOrDisconnect(
+      config.stopSettleMs,
+      disconnectSignal,
+    );
+
+    if (waitResult === "disconnected") {
+      throw new ReconnectRequired(
+        "Disconnected just after StopTransaction",
+        disconnectSignal.info(),
+      );
+    }
   }
 
-  console.log(`[${chargePointId}] Completed`);
+  state.completed = true;
+
+  vcp.transactionManager.stopTransaction(state.transactionId);
+  vcp.close();
+
+  console.log(`[${state.chargePointId}] Completed`);
+}
+
+async function runVcpLifecycle(
+  config: StressConfig,
+  chargePointId: string,
+): Promise<void> {
+  const state: VcpSessionState = {
+    chargePointId,
+    password: buildPassword(chargePointId, config.sharedPassword),
+    transactionId: null,
+    sessionStartedAt: null,
+    startTransactionSent: false,
+    completed: false,
+    reconnectAttempts: 0,
+  };
+
+  while (!state.completed) {
+    try {
+      await runConnectedSessionAttempt(config, state);
+    } catch (error) {
+      if (error instanceof NonRetryableSessionError) {
+        console.error(error.message);
+        throw error;
+      }
+
+      if (!(error instanceof ReconnectRequired)) {
+        console.error(`[${state.chargePointId}] Unexpected failure`, error);
+        throw error;
+      }
+
+      if (!config.reconnectEnabled) {
+        console.error(
+          `[${state.chargePointId}] Reconnect disabled. Stopping VCP lifecycle.`,
+        );
+        throw error;
+      }
+
+      if (state.startTransactionSent && state.transactionId === null) {
+        throw new NonRetryableSessionError(
+          `[${state.chargePointId}] Disconnected after StartTransaction was sent but before transactionId was captured. ` +
+            `To avoid creating duplicate sessions, this VCP will not retry automatically.`,
+        );
+      }
+
+      state.reconnectAttempts += 1;
+
+      if (state.reconnectAttempts > config.maxReconnectAttempts) {
+        throw new NonRetryableSessionError(
+          `[${state.chargePointId}] Max reconnect attempts reached: ${config.maxReconnectAttempts}`,
+        );
+      }
+
+      const delayMs = calculateReconnectDelay(config, state.reconnectAttempts);
+
+      console.warn(
+        `[${state.chargePointId}] Reconnecting attempt ${state.reconnectAttempts}/${config.maxReconnectAttempts} in ${delayMs}ms`,
+      );
+
+      await sleep(delayMs);
+    }
+  }
 }
 
 async function main(): Promise<void> {
-  const endpoint = process.env.WS_URL ?? "ws://localhost:5555";
+  TransactionManager.START_INTERVAL = false;
 
-  const chargePointsCount = parseNumberEnv("CP_COUNT", 10);
-  const chargePointIdPrefix = process.env.ID_PREFIX ?? "CS_2_";
-  const idWidth = parseNumberEnv("ID_WIDTH", 0);
-
-  const rfidTag = process.env.RFID_TAG ?? "TEST";
-  const staggerMs = parseNumberEnv("STAGGER_MS", 1500);
-  const startDelayMs = parseNumberEnv("START_DELAY_MS", 0);
-  const durationMs = parseNumberEnv("DURATION_MS", 300000);
-  const pollMs = parseNumberEnv("POLL_MS", 500);
-  const pollTimeout = parseNumberEnv("POLL_TIMEOUT", 30000);
-  const stopSettleMs = parseNumberEnv("STOP_SETTLE_MS", 3000);
-  const sharedPassword = process.env.PASSWORD || undefined;
+  const config = loadConfig();
 
   console.log("Loaded stress configuration:", {
-    WS_URL: endpoint,
-    CP_COUNT: chargePointsCount,
-    ID_PREFIX: chargePointIdPrefix,
-    ID_WIDTH: idWidth,
-    RFID_TAG: rfidTag,
-    STAGGER_MS: staggerMs,
-    START_DELAY_MS: startDelayMs,
-    DURATION_MS: durationMs,
-    POLL_MS: pollMs,
-    POLL_TIMEOUT: pollTimeout,
-    STOP_SETTLE_MS: stopSettleMs,
-    PASSWORD_MODE: sharedPassword ? "shared PASSWORD" : "per-VCP password",
+    WS_URL: config.endpoint,
+    CP_COUNT: config.chargePointsCount,
+    ID_PREFIX: config.chargePointIdPrefix,
+    ID_WIDTH: config.idWidth,
+    RFID_TAG: config.rfidTag,
+    STAGGER_MS: config.staggerMs,
+    START_DELAY_MS: config.startDelayMs,
+    DURATION_MS: config.durationMs,
+    POLL_MS: config.pollMs,
+    POLL_TIMEOUT: config.pollTimeout,
+    METER_INTERVAL_MS: config.meterIntervalMs,
+    STOP_SETTLE_MS: config.stopSettleMs,
+    RECONNECT_ENABLED: config.reconnectEnabled,
+    MAX_RECONNECT_ATTEMPTS: config.maxReconnectAttempts,
+    RECONNECT_DELAY_MS: config.reconnectDelayMs,
+    RECONNECT_BACKOFF_FACTOR: config.reconnectBackoffFactor,
+    RECONNECT_MAX_DELAY_MS: config.reconnectMaxDelayMs,
+    PASSWORD_MODE: config.sharedPassword ? "shared PASSWORD" : "per-VCP password",
   });
 
   const tasks: Promise<void>[] = [];
 
-  for (let i = 1; i <= chargePointsCount; i++) {
-    const chargePointId =
-      idWidth > 0
-        ? buildChargePointId(chargePointIdPrefix, i, idWidth)
-        : `${chargePointIdPrefix}${i}`;
-
-    const password = buildPassword(chargePointId, sharedPassword);
-
-    console.log(
-      `[${i}/${chargePointsCount}] Launching ${chargePointId} with password=${password}`,
+  for (let i = 1; i <= config.chargePointsCount; i++) {
+    const chargePointId = buildChargePointId(
+      config.chargePointIdPrefix,
+      i,
+      config.idWidth,
     );
 
-    const task = runVcp({
-      chargePointId,
-      password,
-      endpoint,
-      rfidTag,
-      durationMs,
-      pollMs,
-      pollTimeout,
-      startDelayMs,
-      stopSettleMs,
-    }).catch((error) => {
+    console.log(`[${i}/${config.chargePointsCount}] Launching ${chargePointId}`);
+
+    const task = runVcpLifecycle(config, chargePointId).catch((error) => {
       console.error(`[${chargePointId}] Failed`, error);
       throw error;
     });
 
     tasks.push(task);
 
-    if (i < chargePointsCount && staggerMs > 0) {
-      await sleep(staggerMs);
+    if (i < config.chargePointsCount && config.staggerMs > 0) {
+      await sleep(config.staggerMs);
     }
   }
 
-  console.log(`All ${chargePointsCount} VCPs launched. Waiting for completion...`);
+  console.log(
+    `All ${config.chargePointsCount} VCPs launched. Waiting for completion...`,
+  );
 
   const results = await Promise.allSettled(tasks);
 
-  const fulfilled = results.filter((result) => result.status === "fulfilled");
-  const rejected = results.filter((result) => result.status === "rejected");
+  const succeeded = results.filter((result) => result.status === "fulfilled");
+  const failed = results.filter((result) => result.status === "rejected");
 
   console.log("Stress test summary:", {
     total: results.length,
-    succeeded: fulfilled.length,
-    failed: rejected.length,
+    succeeded: succeeded.length,
+    failed: failed.length,
   });
 
-  if (rejected.length > 0) {
+  if (failed.length > 0) {
     process.exit(1);
   }
 
