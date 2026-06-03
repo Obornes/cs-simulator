@@ -1,4 +1,5 @@
 import type { VCP } from "./vcp";
+import { logger } from "./logger";
 
 const METER_VALUES_INTERVAL_SEC = 15;
 
@@ -21,11 +22,14 @@ interface StartTransactionProps {
   meterValuesCallback: (transactionState: TransactionState) => Promise<void>;
 }
 
+type ManagedTransactionState = TransactionState & {
+  meterValuesTimer: ReturnType<typeof setInterval> | null;
+};
+
 export class TransactionManager {
-  transactions: Map<
-    TransactionId,
-    TransactionState & { meterValuesTimer: NodeJS.Timer }
-  > = new Map();
+  static START_INTERVAL = true;
+
+  transactions: Map<TransactionId, ManagedTransactionState> = new Map();
 
   canStartNewTransaction(connectorId: number) {
     return !Array.from(this.transactions.values()).some(
@@ -34,18 +38,53 @@ export class TransactionManager {
   }
 
   startTransaction(vcp: VCP, startTransactionProps: StartTransactionProps) {
-    const meterValuesTimer = setInterval(() => {
-      // biome-ignore lint/style/noNonNullAssertion: transaction must exist
-      const currentTransactionState = this.transactions.get(
-        startTransactionProps.transactionId,
-      )!;
-      const { meterValuesTimer, ...currentTransaction } =
-        currentTransactionState;
-      startTransactionProps.meterValuesCallback({
-        ...currentTransaction,
-        meterValue: this.getMeterValue(startTransactionProps.transactionId),
-      });
-    }, METER_VALUES_INTERVAL_SEC * 1000);
+    /*
+     * Avoid duplicate timers for the same transactionId if the backend/client
+     * retries or if startTransaction is accidentally called twice.
+     */
+    this.stopTransaction(startTransactionProps.transactionId);
+
+    const meterValuesTimer = TransactionManager.START_INTERVAL
+      ? setInterval(() => {
+          const currentTransactionState = this.transactions.get(
+            startTransactionProps.transactionId,
+          );
+
+          if (!currentTransactionState) {
+            return;
+          }
+
+          if (!vcp.isConnected()) {
+            logger.info(
+              `Stopping MeterValues interval for transaction ${startTransactionProps.transactionId}: VCP is not connected`,
+            );
+            this.stopTransaction(startTransactionProps.transactionId);
+            return;
+          }
+
+          const { meterValuesTimer: _meterValuesTimer, ...currentTransaction } =
+            currentTransactionState;
+
+          void startTransactionProps
+            .meterValuesCallback({
+              ...currentTransaction,
+              meterValue: this.getMeterValue(startTransactionProps.transactionId),
+            })
+            .catch((error) => {
+              logger.error(
+                `MeterValues callback failed for transaction ${startTransactionProps.transactionId}`,
+                error,
+              );
+              /*
+               * If sending MeterValues fails, stop this timer. Otherwise the
+               * interval can keep firing forever and eventually crash/noise the
+               * stress test.
+               */
+              this.stopTransaction(startTransactionProps.transactionId);
+            });
+        }, METER_VALUES_INTERVAL_SEC * 1000)
+      : null;
+
     this.transactions.set(startTransactionProps.transactionId, {
       transactionId: startTransactionProps.transactionId,
       idTag: startTransactionProps.idTag,
@@ -53,23 +92,39 @@ export class TransactionManager {
       startedAt: new Date(),
       evseId: startTransactionProps.evseId,
       connectorId: startTransactionProps.connectorId,
-      meterValuesTimer: meterValuesTimer,
+      meterValuesTimer,
     });
   }
 
   stopTransaction(transactionId: TransactionId) {
     const transaction = this.transactions.get(transactionId);
+
     if (transaction?.meterValuesTimer) {
       clearInterval(transaction.meterValuesTimer);
     }
+
     this.transactions.delete(transactionId);
+  }
+
+  stopAllTransactions(reason?: string) {
+    if (reason && this.transactions.size > 0) {
+      logger.info(
+        `Stopping ${this.transactions.size} active transaction timer(s). reason=${reason}`,
+      );
+    }
+
+    for (const transactionId of Array.from(this.transactions.keys())) {
+      this.stopTransaction(transactionId);
+    }
   }
 
   getMeterValue(transactionId: TransactionId) {
     const transaction = this.transactions.get(transactionId);
+
     if (!transaction) {
       return 0;
     }
+
     return (new Date().getTime() - transaction.startedAt.getTime()) / 100;
   }
 }
