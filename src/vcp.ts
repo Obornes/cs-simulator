@@ -20,7 +20,7 @@ import {
   validateOcppOutgoingRequest,
   validateOcppOutgoingResponse,
 } from "./schemaValidator";
-import { TransactionManager } from "./transactionManager";
+import { TransactionManager } from "../../../Downloads/transactionManager";
 import { heartbeatOcppMessage } from "./v16/messages/heartbeat";
 
 interface VCPOptions {
@@ -39,21 +39,19 @@ interface LogEntry {
   metadata: Record<string, unknown>;
 }
 
-export interface VCPDisconnectInfo {
-  source: "close" | "error";
-  code?: number;
-  reason?: string;
-  error?: unknown;
+export interface VCPCallResultEvent {
+  messageId: string;
+  action: string;
+  payload: unknown;
 }
 
-export type VCPDisconnectHandler = (info: VCPDisconnectInfo) => void;
+export type VCPCallResultObserver = (event: VCPCallResultEvent) => void;
 
 export class VCP {
   private ws?: WebSocket;
   private messageHandler: OcppMessageHandler;
   private heartbeatTimer?: ReturnType<typeof setInterval>;
-  private disconnectEmitted = false;
-  private opened = false;
+  private callResultObservers = new Set<VCPCallResultObserver>();
 
   public isFinishing = false;
 
@@ -61,12 +59,9 @@ export class VCP {
 
   constructor(private vcpOptions: VCPOptions) {
     this.messageHandler = resolveMessageHandler(vcpOptions.ocppVersion);
-
     if (vcpOptions.adminPort) {
       const adminApi = new Hono();
-
       adminApi.get("/health", (c) => c.text("OK"));
-
       adminApi.post(
         "/execute",
         zValidator(
@@ -82,7 +77,6 @@ export class VCP {
           return c.text("OK");
         },
       );
-
       serve({
         fetch: adminApi.fetch,
         port: vcpOptions.adminPort,
@@ -90,17 +84,12 @@ export class VCP {
     }
   }
 
-  async connect(onDisconnected?: VCPDisconnectHandler): Promise<void> {
+  async connect(reconnect?: () => void): Promise<void> {
     logger.info(`Connecting... | ${util.inspect(this.vcpOptions)}`);
-
     this.isFinishing = false;
-    this.disconnectEmitted = false;
-    this.opened = false;
-
     return new Promise((resolve, reject) => {
       const websocketUrl = `${this.vcpOptions.endpoint}/${this.vcpOptions.chargePointId}`;
       const protocol = toProtocolVersion(this.vcpOptions.ocppVersion);
-
       this.ws = new WebSocket(websocketUrl, [protocol], {
         rejectUnauthorized: false,
         followRedirects: true,
@@ -113,133 +102,104 @@ export class VCP {
         },
       });
 
-      this.ws.on("open", () => {
-        this.opened = true;
-        resolve();
-      });
-
+      this.ws.on("open", () => resolve());
       this.ws.on("message", (message: string) => this._onMessage(message));
-
       this.ws.on("ping", () => {
         logger.info("Received PING");
       });
-
       this.ws.on("pong", () => {
         logger.info("Received PONG");
       });
-
-      this.ws.on("close", (code: number, reasonBuffer: Buffer) => {
-        const reason = reasonBuffer?.toString?.() ?? "";
-
-        if (!this.opened) {
-          reject(
-            new Error(
-              `WebSocket closed before open. code=${code}, reason=${reason}`,
-            ),
-          );
-          return;
-        }
-
-        this._onDisconnect(
-          {
-            source: "close",
-            code,
-            reason,
-          },
-          onDisconnected,
-        );
-      });
-
+      this.ws.on("close", (code: number, reason: Buffer) =>
+        this._onClose(code, reason?.toString?.() ?? "", reconnect),
+      );
       this.ws.on("error", (error: unknown) => {
-        logger.error("Error on websocket", error);
-
-        if (!this.opened) {
-          reject(error);
+        logger.error(`Error on websocket`, error);
+        if (this.isFinishing) {
           return;
         }
-
-        this._onDisconnect(
-          {
-            source: "error",
-            error,
-          },
-          onDisconnected,
-        );
+        if (reconnect) {
+          setTimeout(() => reconnect(), 1000);
+        } else {
+          reject(error);
+        }
       });
     });
+  }
+
+  onCallResult(observer: VCPCallResultObserver): () => void {
+    this.callResultObservers.add(observer);
+
+    return () => {
+      this.callResultObservers.delete(observer);
+    };
   }
 
   isConnected(): boolean {
     return this.ws?.readyState === WebSocket.OPEN;
   }
 
-  // biome-ignore lint/suspicious/noExplicitAny: OCPP payloads are action-specific
-  send(ocppCall: OcppCall<any>) {
-    if (!this.ws) {
-      throw new Error("Websocket not initialized. Call connect() first");
+  // biome-ignore lint/suspicious/noExplicitAny: ocpp types
+  send(ocppCall: OcppCall<any>): boolean {
+    /*
+     * Stress-test safety:
+     * MeterValues / Heartbeat timers can still fire while the VCP is closing
+     * or after the backend closed the websocket. In that case, do not throw a
+     * fatal exception because it crashes the whole stress-test process.
+     */
+    if (!this.canSend(ocppCall.action)) {
+      return false;
     }
 
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error(
-        `Cannot send ${ocppCall.action}. WebSocket is not open. readyState=${this.ws.readyState}`,
+    try {
+      validateOcppOutgoingRequest(
+        this.vcpOptions.ocppVersion,
+        ocppCall.action,
+        JSON.parse(JSON.stringify(ocppCall.payload)),
       );
+
+      ocppOutbox.enqueue(ocppCall);
+
+      const jsonMessage = JSON.stringify([
+        2,
+        ocppCall.messageId,
+        ocppCall.action,
+        ocppCall.payload,
+      ]);
+
+      logger.info(`Sending message ➡️  ${jsonMessage}`);
+
+      this.ws?.send(jsonMessage);
+      return true;
+    } catch (error) {
+      logger.error(
+        `Failed to send ${ocppCall.action} for ${this.vcpOptions.chargePointId}`,
+        error,
+      );
+      return false;
     }
-
-    ocppOutbox.enqueue(ocppCall);
-
-    const jsonMessage = JSON.stringify([
-      2,
-      ocppCall.messageId,
-      ocppCall.action,
-      ocppCall.payload,
-    ]);
-
-    logger.info(`Sending message ➡️  ${jsonMessage}`);
-
-    validateOcppOutgoingRequest(
-      this.vcpOptions.ocppVersion,
-      ocppCall.action,
-      JSON.parse(JSON.stringify(ocppCall.payload)),
-    );
-
-    this.ws.send(jsonMessage);
   }
 
-  // biome-ignore lint/suspicious/noExplicitAny: OCPP payloads are action-specific
+  // biome-ignore lint/suspicious/noExplicitAny: ocpp types
   respond(result: OcppCallResult<any>) {
-    if (!this.ws) {
-      throw new Error("Websocket not initialized. Call connect() first");
-    }
-
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error(
-        `Cannot respond to ${result.action}. WebSocket is not open. readyState=${this.ws.readyState}`,
-      );
+    if (!this.canRespond(`respond to ${result.action}`)) {
+      return;
     }
 
     const jsonMessage = JSON.stringify([3, result.messageId, result.payload]);
-
     logger.info(`Responding with ➡️  ${jsonMessage}`);
-
     validateOcppIncomingResponse(
       this.vcpOptions.ocppVersion,
       result.action,
       JSON.parse(JSON.stringify(result.payload)),
     );
-
-    this.ws.send(jsonMessage);
+    this.ws?.send(jsonMessage);
   }
 
-  // biome-ignore lint/suspicious/noExplicitAny: OCPP payloads are action-specific
+  // biome-ignore lint/suspicious/noExplicitAny: ocpp types
   respondError(error: OcppCallError<any>) {
-    if (!this.ws) {
-      throw new Error("Websocket not initialized. Call connect() first");
-    }
-
-    if (this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error(
-        `Cannot respond with error. WebSocket is not open. readyState=${this.ws.readyState}`,
-      );
+    if (!this.canRespond("respond with error")) {
+      return;
     }
 
     const jsonMessage = JSON.stringify([
@@ -249,15 +209,53 @@ export class VCP {
       error.errorDescription,
       error.errorDetails,
     ]);
-
     logger.info(`Responding with ➡️  ${jsonMessage}`);
+    this.ws?.send(jsonMessage);
+  }
 
-    this.ws.send(jsonMessage);
+  private canSend(action: string): boolean {
+    if (this.isFinishing) {
+      logger.info(
+        `Skipping ${action}: VCP ${this.vcpOptions.chargePointId} is finishing`,
+      );
+      return false;
+    }
+
+    if (!this.ws) {
+      logger.info(
+        `Skipping ${action}: websocket is not initialized for ${this.vcpOptions.chargePointId}`,
+      );
+      return false;
+    }
+
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      logger.info(
+        `Skipping ${action}: websocket is not open for ${this.vcpOptions.chargePointId}. readyState=${this.ws.readyState}`,
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  private canRespond(operation: string): boolean {
+    if (!this.ws) {
+      logger.warn(`Cannot ${operation}. WebSocket is not initialized.`);
+      return false;
+    }
+
+    if (this.ws.readyState !== WebSocket.OPEN) {
+      logger.warn(
+        `Cannot ${operation}. WebSocket is not open. readyState=${this.ws.readyState}`,
+      );
+      return false;
+    }
+
+    return true;
   }
 
   configureHeartbeat(interval: number) {
     this.clearHeartbeat();
-
     this.heartbeatTimer = setInterval(() => {
       if (!this.isConnected()) {
         return;
@@ -281,6 +279,9 @@ export class VCP {
   close() {
     this.isFinishing = true;
     this.clearHeartbeat();
+    this.transactionManager.stopAllTransactions(
+      `VCP ${this.vcpOptions.chargePointId} is closing`,
+    );
 
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.close();
@@ -292,6 +293,9 @@ export class VCP {
   terminate() {
     this.isFinishing = true;
     this.clearHeartbeat();
+    this.transactionManager.stopAllTransactions(
+      `VCP ${this.vcpOptions.chargePointId} is terminating`,
+    );
 
     if (this.ws) {
       this.ws.terminate();
@@ -340,75 +344,80 @@ export class VCP {
   }
 
   private _onMessage(message: string) {
-    logger.info(`Receive message ⬅️  ${message}`);
-
-    const data = JSON.parse(message);
-    const [type, ...rest] = data;
-
-    if (type === 2) {
-      const [messageId, action, payload] = rest;
-
-      validateOcppIncomingRequest(this.vcpOptions.ocppVersion, action, payload);
-
-      this.messageHandler.handleCall(this, {
-        messageId,
-        action,
-        payload,
-      });
-    } else if (type === 3) {
-      const [messageId, payload] = rest;
-      const enqueuedCall = ocppOutbox.get(messageId);
-
-      if (!enqueuedCall) {
-        throw new Error(
-          `Received CallResult for unknown messageId=${messageId}`,
+    try {
+      logger.info(`Receive message ⬅️  ${message}`);
+      const data = JSON.parse(message);
+      const [type, ...rest] = data;
+      if (type === 2) {
+        const [messageId, action, payload] = rest;
+        validateOcppIncomingRequest(this.vcpOptions.ocppVersion, action, payload);
+        this.messageHandler.handleCall(this, { messageId, action, payload });
+      } else if (type === 3) {
+        const [messageId, payload] = rest;
+        const enqueuedCall = ocppOutbox.get(messageId);
+        if (!enqueuedCall) {
+          logger.warn(`Ignoring CallResult for unknown messageId=${messageId}`);
+          return;
+        }
+        validateOcppOutgoingResponse(
+          this.vcpOptions.ocppVersion,
+          enqueuedCall.action,
+          payload,
         );
+
+        for (const observer of this.callResultObservers) {
+          try {
+            observer({
+              messageId,
+              payload,
+              action: enqueuedCall.action,
+            });
+          } catch (error) {
+            logger.error("VCP call result observer failed", error);
+          }
+        }
+
+        this.messageHandler.handleCallResult(this, enqueuedCall, {
+          messageId,
+          payload,
+          action: enqueuedCall.action,
+        });
+      } else if (type === 4) {
+        const [messageId, errorCode, errorDescription, errorDetails] = rest;
+        this.messageHandler.handleCallError(this, {
+          messageId,
+          errorCode,
+          errorDescription,
+          errorDetails,
+        });
+      } else {
+        logger.warn(`Ignoring unrecognized message type ${type}`);
       }
-
-      validateOcppOutgoingResponse(
-        this.vcpOptions.ocppVersion,
-        enqueuedCall.action,
-        payload,
-      );
-
-      this.messageHandler.handleCallResult(this, enqueuedCall, {
-        messageId,
-        payload,
-        action: enqueuedCall.action,
-      });
-    } else if (type === 4) {
-      const [messageId, errorCode, errorDescription, errorDetails] = rest;
-
-      this.messageHandler.handleCallError(this, {
-        messageId,
-        errorCode,
-        errorDescription,
-        errorDetails,
-      });
-    } else {
-      throw new Error(`Unrecognized message type ${type}`);
+    } catch (error) {
+      if (this.isFinishing) {
+        logger.warn("Ignoring incoming message during VCP shutdown", error);
+        return;
+      }
+      logger.error("Failed to process incoming OCPP message", error);
     }
   }
 
-  private _onDisconnect(
-    info: VCPDisconnectInfo,
-    onDisconnected?: VCPDisconnectHandler,
-  ) {
+  private _onClose(code: number, reason: string, reconnect?: () => void) {
     if (this.isFinishing) {
       return;
     }
 
-    if (this.disconnectEmitted) {
-      return;
-    }
-
-    this.disconnectEmitted = true;
+    this.isFinishing = true;
     this.clearHeartbeat();
-
-    logger.info(
-      `Connection disconnected. source=${info.source}, code=${info.code}, reason=${info.reason}`,
+    this.transactionManager.stopAllTransactions(
+      `VCP ${this.vcpOptions.chargePointId} websocket closed`,
     );
+    this.ws = undefined;
 
-    onDisconnected?.(info);
+    logger.info(`Connection closed. code=${code}, reason=${reason}`);
+
+    if (reconnect) {
+      reconnect();
+    }
   }
 }

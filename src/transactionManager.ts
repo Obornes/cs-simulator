@@ -1,10 +1,11 @@
-import type { VCP } from "./vcp";
+import type { VCP } from "../../../Downloads/vcp";
+import { logger } from "./logger";
 
 const METER_VALUES_INTERVAL_SEC = 15;
 
 type TransactionId = string | number;
 
-export interface TransactionState {
+interface TransactionState {
   startedAt: Date;
   idTag: string;
   transactionId: TransactionId;
@@ -21,13 +22,14 @@ interface StartTransactionProps {
   meterValuesCallback: (transactionState: TransactionState) => Promise<void>;
 }
 
+type ManagedTransactionState = TransactionState & {
+  meterValuesTimer: ReturnType<typeof setInterval> | null;
+};
+
 export class TransactionManager {
   static START_INTERVAL = true;
 
-  transactions: Map<
-    TransactionId,
-    TransactionState & { meterValuesTimer: ReturnType<typeof setInterval> | null }
-  > = new Map();
+  transactions: Map<TransactionId, ManagedTransactionState> = new Map();
 
   canStartNewTransaction(connectorId: number) {
     return !Array.from(this.transactions.values()).some(
@@ -35,7 +37,13 @@ export class TransactionManager {
     );
   }
 
-  startTransaction(_vcp: VCP, startTransactionProps: StartTransactionProps) {
+  startTransaction(vcp: VCP, startTransactionProps: StartTransactionProps) {
+    /*
+     * Avoid duplicate timers for the same transactionId if the backend/client
+     * retries or if startTransaction is accidentally called twice.
+     */
+    this.stopTransaction(startTransactionProps.transactionId);
+
     const meterValuesTimer = TransactionManager.START_INTERVAL
       ? setInterval(() => {
           const currentTransactionState = this.transactions.get(
@@ -46,13 +54,34 @@ export class TransactionManager {
             return;
           }
 
-          const { meterValuesTimer: _timer, ...currentTransaction } =
+          if (!vcp.isConnected()) {
+            logger.info(
+              `Stopping MeterValues interval for transaction ${startTransactionProps.transactionId}: VCP is not connected`,
+            );
+            this.stopTransaction(startTransactionProps.transactionId);
+            return;
+          }
+
+          const { meterValuesTimer: _meterValuesTimer, ...currentTransaction } =
             currentTransactionState;
 
-          startTransactionProps.meterValuesCallback({
-            ...currentTransaction,
-            meterValue: this.getMeterValue(startTransactionProps.transactionId),
-          });
+          void startTransactionProps
+            .meterValuesCallback({
+              ...currentTransaction,
+              meterValue: this.getMeterValue(startTransactionProps.transactionId),
+            })
+            .catch((error) => {
+              logger.error(
+                `MeterValues callback failed for transaction ${startTransactionProps.transactionId}`,
+                error,
+              );
+              /*
+               * If sending MeterValues fails, stop this timer. Otherwise the
+               * interval can keep firing forever and eventually crash/noise the
+               * stress test.
+               */
+              this.stopTransaction(startTransactionProps.transactionId);
+            });
         }, METER_VALUES_INTERVAL_SEC * 1000)
       : null;
 
@@ -67,19 +96,6 @@ export class TransactionManager {
     });
   }
 
-  restoreTransaction(transactionState: TransactionState) {
-    const existing = this.transactions.get(transactionState.transactionId);
-
-    if (existing?.meterValuesTimer) {
-      clearInterval(existing.meterValuesTimer);
-    }
-
-    this.transactions.set(transactionState.transactionId, {
-      ...transactionState,
-      meterValuesTimer: null,
-    });
-  }
-
   stopTransaction(transactionId: TransactionId) {
     const transaction = this.transactions.get(transactionId);
 
@@ -90,24 +106,16 @@ export class TransactionManager {
     this.transactions.delete(transactionId);
   }
 
-  stopAllTransactions() {
-    for (const transaction of this.transactions.values()) {
-      if (transaction.meterValuesTimer) {
-        clearInterval(transaction.meterValuesTimer);
-      }
+  stopAllTransactions(reason?: string) {
+    if (reason && this.transactions.size > 0) {
+      logger.info(
+        `Stopping ${this.transactions.size} active transaction timer(s). reason=${reason}`,
+      );
     }
 
-    this.transactions.clear();
-  }
-
-  getTransactionByConnector(connectorId: number) {
-    return Array.from(this.transactions.values()).find(
-      (transaction) => transaction.connectorId === connectorId,
-    );
-  }
-
-  hasTransaction(transactionId: TransactionId) {
-    return this.transactions.has(transactionId);
+    for (const transactionId of Array.from(this.transactions.keys())) {
+      this.stopTransaction(transactionId);
+    }
   }
 
   getMeterValue(transactionId: TransactionId) {
