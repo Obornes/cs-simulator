@@ -1,4 +1,4 @@
-import type { VCP } from "../../../Downloads/vcp";
+import type { VCP } from "./vcp";
 import { logger } from "./logger";
 
 const METER_VALUES_INTERVAL_SEC = 15;
