@@ -78,7 +78,7 @@ async function waitForTransactionId(
   );
 
   for (let i = 1; i <= chargePointsCount; i++) {
-    const chargePointId = `${chargePointIdPrefix}${String(i).padStart(4, "0")}`;
+    const chargePointId = `${chargePointIdPrefix}${i}`;
 
     await connectToVCP({
       chargePointId,
@@ -176,7 +176,7 @@ async function connectToVCP({ chargePointId, pollMs, pollTimeout, durationMs, sh
     }
 
     // 4 — Send MeterValues every 10s until sessionStartedAt + durationMs
-    const METER_INTERVAL_MS = 10_000;
+    const METER_INTERVAL_MS = 30_000;
     const deadline = sessionStartedAt.getTime() + durationMs;
     while (Date.now() < deadline) {
       const waitMs = Math.min(METER_INTERVAL_MS, deadline - Date.now());
