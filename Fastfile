@@ -10,7 +10,6 @@ requires:
 
 name = "cs-simulator"
 version = "1.1.18"
-CLOUD_WS_URL = "wss://cpc.eu-stable.uat.charge.ampeco.tech:443/obornes"
 CP_PASSWORD =  ""
 CP_ID = "CS*SIMULATOR*1"
 
@@ -32,11 +31,12 @@ goal dockerize:
         sh: docker buildx build --load -f ./devops/Dockerfile \
             -t ${name}:latest .
     goal shell:
-        - CP_ID DEFAULT_CP_ID
+        - CP_ID CP_ID
+        - WS_URL !
         sh: docker run -it --rm \
             --name $name \
             --entrypoint /bin/ash \
-            -e WS_URL=$CLOUD_WS_URL \
+            -e WS_URL=$WS_URL \
             -e CP_ID=$CP_ID \
             -e PASSWORD=$CP_PASSWORD \
             ${name}:latest
@@ -62,10 +62,11 @@ goal github:
 # Application management
 goal app:
     goal start:
-        - CP_ID DEFAULT_CP_ID
+        - CP_ID CP_ID
+        - WS_URL !
         sh: docker run --rm -t \
             --name $name \
-            -e WS_URL=$CLOUD_WS_URL \
+            -e WS_URL=$WS_URL \
             -e CP_ID=$CP_ID \
             -e PASSWORD=$CP_PASSWORD \
             ${name}:latest \
