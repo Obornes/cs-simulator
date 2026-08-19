@@ -43,6 +43,8 @@ export abstract class OcppBase<
         payload: payload,
         errors: JSON.stringify(parseResult.error.issues),
       });
+      // Return original payload if parsing fails to avoid returning undefined
+      return payload;
     }
     return parseResult.data;
   };
@@ -55,6 +57,8 @@ export abstract class OcppBase<
         payload: payload,
         errors: JSON.stringify(parseResult.error.issues),
       });
+      // Return original payload if parsing fails to avoid returning undefined
+      return payload;
     }
     return parseResult.data;
   };
@@ -87,6 +91,16 @@ export abstract class OcppOutgoing<
     _call: OcppCall<z.infer<ReqSchema>>,
     _result: OcppCallResult<z.infer<ResSchema>>,
   ) => Promise<void>;
+
+  /**
+   * Optional last-moment rewrite of an outgoing payload, applied by
+   * `VCP.send()` before the call is enqueued in the outbox and serialized.
+   * Lets a message fill in values that the caller (e.g. an admin command)
+   * cannot know, based on current VCP state. Return the payload unchanged to
+   * opt out.
+   */
+  beforeSend?: (vcp: VCP, payload: z.infer<ReqSchema>) => z.infer<ReqSchema> =
+    undefined;
 
   request = (payload: z.infer<ReqSchema>): OcppCall<z.infer<ReqSchema>> => {
     return call(this.action, this.parseRequestPayload(payload));
