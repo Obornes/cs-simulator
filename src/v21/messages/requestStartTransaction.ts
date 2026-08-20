@@ -35,7 +35,7 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
     call: OcppCall<z.infer<RequestStartTransactionReqType>>,
   ): Promise<void> => {
     const transactionEvseId = call.payload.evseId ?? 1;
-    const transactionConnectorId = 1;
+    const transactionConnectorId = transactionEvseId;
 
     // Check if a transaction is already running on this connector
     if (
