@@ -26,6 +26,17 @@ CP_ID - ID of this VCP
 PASSWORD - if used for OCPP Authentication, otherwise can be left blank
 ```
 
+Optional:
+
+```
+TOKEN - token this station authorizes with, substituted into admin commands (see below)
+DISABLE_METER_VALUES - set to "true" to stop sending periodic MeterValues for ongoing transactions
+CONNECTORLESS_FLOW_CONNECTOR_ID - connector to use when a RemoteStartTransaction arrives without a connectorId
+```
+
+By default a `RemoteStartTransaction` without a `connectorId` is rejected.
+Setting `CONNECTORLESS_FLOW_CONNECTOR_ID` makes the VCP accept it on that fixed connector instead.
+
 Run OCPP 1.6:
 
 ```bash
@@ -51,6 +62,32 @@ npm start .env.production index_16.ts
 npm start production index_16.ts
 ```
 
+### Auto-restart
+
+Normally, the VCP will exit after receiving the `Reset` message.
+If you want to let the VCP re-establish the WS connection after receiving the `Reset` message, you can use the `npm start:auto-restart` command.
+
+Example:
+```bash
+WS_URL=ws://localhost:3000 CP_ID=vcp_16_test npm run start:auto-restart index_16.ts
+
+# ...
+2026-03-06 09:55:51 info: Receive message ⬅️  [2,"248a82ba-58e3-4a3d-ae8f-74470add510f","Reset",{"type":"Hard"}]
+2026-03-06 09:55:51 info: Responding with ➡️  [3,"248a82ba-58e3-4a3d-ae8f-74470add510f",{"status":"Accepted"}]
+2026-03-06 09:55:51 info: Waiting for 3 seconds to close VCP...
+2026-03-06 09:55:54 info: Closing VCP
+2026-03-06 09:55:54 info: Auto-restart enabled. Closing old VCP...
+2026-03-06 09:55:54 info: Waiting for 3 seconds...
+2026-03-06 09:55:57 info: Starting new VCP
+2026-03-06 09:55:57 info: Connecting... | {
+  endpoint: 'ws://localhost:3000',
+  chargePointId: 'vcp_16_test',
+  ocppVersion: 'OCPP_1.6',
+  basicAuthPassword: '123',
+  adminPort: 9999
+}
+# ...
+```
 
 ## Example
 
@@ -87,6 +124,39 @@ For example usage, see `admin/` folder.
 
 ```bash
 npx tsx admin/v16/Authorize/authorize.ts
+```
+
+### Placeholders in admin commands
+
+The commands in `admin/` are shared across charge points, so they cannot hardcode a station's token or know the id of a transaction that is already running.
+Instead they send placeholders, which the VCP substitutes from its own state just before the message goes out.
+Substitution happens in the VCP process — the admin command only proxies the payload to it — so `TOKEN` belongs in the env file the VCP was started with, not on the admin command:
+
+| Placeholder | Substituted with |
+| --- | --- |
+| token `__TOKEN__` | the `TOKEN` env var |
+| `transactionId` of `0` (or `"0"` in 2.0.1/2.1) | the id of the ongoing transaction |
+
+Both are best-effort and never guess:
+
+- A token other than `__TOKEN__` is sent as-is, so a command that spells out a real token keeps working. If `TOKEN` is not set, the placeholder is sent unchanged — the Central System then rejects a recognisable value instead of the command silently authorizing as someone else.
+- A `transactionId` is only resolved when there is exactly one ongoing transaction. With none, or more than one, the `0` is sent unchanged and the Central System decides how to respond. Set `TRANSACTION_ID` to target a specific transaction.
+
+```bash
+# .env.platform-dev.my-station
+WS_URL=ws://localhost:3000
+CP_ID=my-station
+TOKEN=AABBCCDD
+```
+
+```bash
+# the station is started with that env file...
+npm start platform-dev.my-station index_16.ts
+
+# ...then the same commands work against any station: the transaction starts
+# with that station's TOKEN and stops without its id having to be looked up
+npx tsx admin/v16/Transaction/startTransaction.ts
+npx tsx admin/v16/Transaction/stopTransaction.ts
 ```
 
 ---
