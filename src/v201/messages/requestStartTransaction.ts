@@ -35,12 +35,15 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
     call: OcppCall<z.infer<RequestStartTransactionReqType>>,
   ): Promise<void> => {
     const transactionEvseId = call.payload.evseId ?? 1;
-    const transactionConnectorId = 1;
+    // RequestStartTransaction only lets the CSMS target an EVSE - the charge point picks
+    // which of its connectors to actually use. This codebase currently models exactly one
+    // connector per EVSE (same convention the CPMS's own seed data uses), so the EVSE id
+    // doubles as the connector id for now. If a station ever needs several connectors per
+    // EVSE, this is the one place to resolve a real connectorId instead of reusing evseId.
+    const resolvedConnectorId = transactionEvseId;
 
     // Check if a transaction is already running on this connector
-    if (
-      !vcp.transactionManager.canStartNewTransaction(transactionConnectorId)
-    ) {
+    if (!vcp.transactionManager.canStartNewTransaction(resolvedConnectorId)) {
       vcp.respond(
         this.response(call, {
           status: "Rejected",
@@ -54,7 +57,7 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
       transactionId: transactionId,
       idTag: call.payload.idToken.idToken,
       evseId: transactionEvseId,
-      connectorId: transactionConnectorId,
+      connectorId: resolvedConnectorId,
       meterValuesCallback: async (transactionStatus) => {
         vcp.send(
           transactionEventOcppOutgoing.request({
@@ -67,7 +70,7 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
             },
             evse: {
               id: transactionEvseId,
-              connectorId: transactionConnectorId,
+              connectorId: resolvedConnectorId,
             },
             meterValue: [
               {
@@ -95,7 +98,7 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
     vcp.send(
       statusNotificationOcppOutgoing.request({
         evseId: transactionEvseId,
-        connectorId: transactionConnectorId,
+        connectorId: resolvedConnectorId,
         connectorStatus: "Occupied",
         timestamp: new Date().toISOString(),
       }),
@@ -113,7 +116,7 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
         idToken: call.payload.idToken,
         evse: {
           id: transactionEvseId,
-          connectorId: transactionConnectorId,
+          connectorId: resolvedConnectorId,
         },
         meterValue: [
           {
