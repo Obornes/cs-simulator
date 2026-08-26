@@ -32,9 +32,15 @@ export class TransactionManager {
     TransactionState & { meterValuesTimer?: ReturnType<typeof setInterval> }
   > = new Map();
 
-  canStartNewTransaction(connectorId: number) {
+  // evseId is undefined for OCPP 1.6, which has no EVSE concept and numbers
+  // connectors globally per station - in that case connectorId alone is the
+  // full identity. For 2.0.1/2.1, connectorId is only unique within its
+  // evseId, so both must match to detect a collision.
+  canStartNewTransaction(evseId: number | undefined, connectorId: number) {
     return !Array.from(this.transactions.values()).some(
-      (transaction) => transaction.connectorId === connectorId,
+      (transaction) =>
+        transaction.evseId === evseId &&
+        transaction.connectorId === connectorId,
     );
   }
 

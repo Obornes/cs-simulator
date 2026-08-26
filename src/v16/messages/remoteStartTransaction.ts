@@ -47,7 +47,10 @@ class RemoteStartTransactionOcppMessage extends OcppIncoming<
       }
     }
     if (
-      !vcp.transactionManager.canStartNewTransaction(call.payload.connectorId)
+      !vcp.transactionManager.canStartNewTransaction(
+        undefined,
+        call.payload.connectorId,
+      )
     ) {
       logger.warn(
         `Rejecting RemoteStartTransaction: connector ${call.payload.connectorId} already has an ongoing transaction.`,

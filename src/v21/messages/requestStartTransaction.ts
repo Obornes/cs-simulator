@@ -34,13 +34,18 @@ class RequestStartTransactionOcppIncoming extends OcppIncoming<
     vcp: VCP,
     call: OcppCall<z.infer<RequestStartTransactionReqType>>,
   ): Promise<void> => {
-    const transactionEvseId = call.payload.evseId ?? 1;
-    const transactionConnectorId = 1;
+    const transactionEvseId = call.payload.evseId ?? vcp.evses[0].id;
+    const evse = vcp.evses.find((e) => e.id === transactionEvseId);
+    const transactionConnectorId = evse?.connectorIds.find((connectorId) =>
+      vcp.transactionManager.canStartNewTransaction(
+        transactionEvseId,
+        connectorId,
+      ),
+    );
 
-    // Check if a transaction is already running on this connector
-    if (
-      !vcp.transactionManager.canStartNewTransaction(transactionConnectorId)
-    ) {
+    // Reject if the EVSE is unknown, or every one of its connectors already
+    // has an ongoing transaction.
+    if (transactionConnectorId === undefined) {
       vcp.respond(
         this.response(call, {
           status: "Rejected",

@@ -25,12 +25,22 @@ import { TransactionManager } from "./transactionManager";
 import { heartbeatOcppMessage } from "./v16/messages/heartbeat";
 import { close } from "./close";
 
+export interface EvseTopology {
+  id: number;
+  connectorIds: number[];
+}
+
 interface VCPOptions {
   ocppVersion: OcppVersion;
   endpoint: string;
   chargePointId: string;
   basicAuthPassword?: string;
   adminPort?: number;
+  // Charge point's EVSE/connector topology, used to resolve requests (e.g.
+  // RequestStartTransaction) that target an EVSE without specifying a
+  // connector. Defaults to a single EVSE with a single connector, matching
+  // every scenario script that predates multi-EVSE support.
+  evses?: EvseTopology[];
 }
 
 interface LogEntry {
@@ -52,8 +62,10 @@ export class VCP {
   private postMessageActions: Record<string, () => void | Promise<void>> = {};
 
   transactionManager = new TransactionManager();
+  evses: EvseTopology[];
 
   constructor(private vcpOptions: VCPOptions) {
+    this.evses = vcpOptions.evses ?? [{ id: 1, connectorIds: [1] }];
     this.messageHandler = resolveMessageHandler(vcpOptions.ocppVersion);
     if (vcpOptions.adminPort) {
       const adminApi = new Hono();
