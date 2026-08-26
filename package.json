@@ -3,7 +3,7 @@
   "version": "0.0.1",
   "description": "Simple OCPP Virtual Charging Point",
   "engines": {
-    "node": ">=20.0.0"
+    "node": ">=24.0.0"
   },
   "scripts": {
     "start": "./start.sh",
@@ -11,8 +11,9 @@
     "lint": "biome lint src",
     "format": "biome format src",
     "format:check": "biome ci --linter-enabled=false --organize-imports-enabled=false src",
-    "typecheck": "tsc --noEmit --esModuleInterop --skipLibCheck src/**/*.ts",
-    "check": "npm run lint && npm run format:check && npm run typecheck"
+    "typecheck": "tsc -p tsconfig.json",
+    "test": "tsx --test 'src/**/*.test.ts'",
+    "check": "npm run lint && npm run format:check && npm run typecheck && npm run test"
   },
   "author": "Solidstudio",
   "license": "Apache-2.0",
@@ -25,13 +26,14 @@
     "dotenv": "^16.4.7",
     "hono": "^4.12.2",
     "typescript": "^5.8.2",
-    "uuid": "^10.0.0",
+    "uuid": "^14.0.2",
     "winston": "^3.17.0",
     "ws": "^8.18.1",
     "zod": "^3.24.2"
   },
   "devDependencies": {
     "@biomejs/biome": "1.9.4",
+    "@types/node": "^24.13.3",
     "@types/uuid": "^10.0.0",
     "@types/ws": "^8.18.0",
     "tsx": "^4.19.3"
