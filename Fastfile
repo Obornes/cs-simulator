@@ -27,6 +27,15 @@ full_image_name       = image_name + ":git-" + version + "-" + hash_git
 release_image_name    = image_name + ":v" + version
 
 
+# Quality gate - delegates to the npm scripts in package.json rather than
+# duplicating lint/format/typecheck/test logic here.
+goal check:sh:
+    npm run check
+
+# Unit tests only (node:test via tsx), without lint/format/typecheck.
+goal test:sh:
+    npm run test
+
 goal dockerize:
     goal build:
         sh: docker buildx build --load -f ./devops/Dockerfile \
