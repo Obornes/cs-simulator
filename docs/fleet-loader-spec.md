@@ -1,6 +1,21 @@
 # Fleet Loader & Console — Spec (`qa/`)
 
-Status: draft. Consolidates a design discussion; no implementation yet.
+Status: draft. Consolidates a design discussion. Implemented so far:
+- §4 (both sources, unioned, plus the regex include/exclude pass) and §5.1/§5.2 (schemas) —
+  `qa/manifest.ts`, `qa/onceProvider.ts`, `qa/regexFilter.ts`, `qa/fleetSource.ts`, `qa/config.ts`.
+  `loadFleet()` takes optional `cliIncludePatterns`/`cliExcludePatterns` (§8.3's CLI-flag side) as
+  parameters rather than reading `process.argv` itself — no CLI parser exists yet.
+- §6.1's connector-aware `Station` and its boot sequence, and §6.2's staggered connection
+  fan-out/failure isolation/progress reporting — `qa/station.ts`, `qa/orchestrate.ts`, `qa/stats.ts`,
+  `qa/run.ts`. **Not yet implemented**: any charging-session logic (§6.1's `tick()`,
+  `startChargingSession`, `disconnectCheck`) or charge-point-initiated command handling
+  (`RemoteStart/StopTransaction`, `RequestStart/StopTransaction` — every incoming Call is currently
+  answered with a `NotImplemented` CallError so the CSMS doesn't hang). `qa/run.ts` also doesn't start
+  §7's console yet (it doesn't exist) — it just connects the fleet and prints periodic progress until
+  `SIGINT`/`SIGTERM`.
+
+All with tests (`npm run check`). Everything else (§7 console, §9's remaining files) is still
+unimplemented design.
 
 Lives in a new, independent top-level `qa/` directory — not inside `demo/`. `demo/` is left
 untouched: it keeps serving its original purpose (broad network/chaos load testing). `qa/` is a
@@ -89,11 +104,11 @@ Fetched from `obornes-cpo-backbone`'s public API. Contract confirmed by reading 
   - `ocppVersion: string`
   - `chargingPoints: ChargingPointDto[]` — each has `ocppEvseId: number` and `connectors: [...]`.
 
-**If unconfigured:** the CPMS source requires **both** `CPMS_API_URL` and `CPMS_API_KEY` (§8.1) to
+**If unconfigured:** the CPMS source requires **both** `ONCE_API_URL` and `ONCE_API_KEY` (§8.1) to
 make a call at all — if either is missing, this source contributes an empty list, no request is
 attempted, and it's not an error (the expected shape for "explicit-list-only, no CPMS").
-`CPMS_API_TENANT_ID` stays independently optional per §8.1 and never gates this on its own — a
-single-tenant environment legitimately has `CPMS_API_URL`/`CPMS_API_KEY` set and no tenant id, and
+`ONCE_API_TENANT_ID` stays independently optional per §8.1 and never gates this on its own — a
+single-tenant environment legitimately has `ONCE_API_URL`/`ONCE_API_KEY` set and no tenant id, and
 that still fetches normally.
 
 ### 4c. Regex include/exclude filters (§8.3) — applied after unioning both sources
@@ -163,7 +178,7 @@ used:
   reserved for whole-charge-point messages) — `evseId` there is purely an internal grouping label,
   never sent.
 - **`evses`** — the explicit, real topology: an array of `{ id, connectorIds }`. Required for a
-  station with more than one EVSE, and what `qa/cpmsProvider.ts` (§4b) always produces, since the CPMS
+  station with more than one EVSE, and what `qa/onceProvider.ts` (§4b) always produces, since the CPMS
   response already carries the real per-EVSE connector list — nothing is discarded on that path.
 
 Exactly one of the two must be given; the schema's `.transform()` normalizes `connectorCount` into the
@@ -410,6 +425,180 @@ mirroring what `demo/`'s equivalent does for its single hardcoded connector, jus
 No new concepts are introduced here — every point above is "the same operation `demo/` already does
 for its one hardcoded connector, looped over connectors instead of assumed singular."
 
+### 6.2 Fleet startup orchestration (`qa/run.ts`)
+
+This is the part that actually turns a `StationSpec[]` (already fetched from ONCE and/or the static
+manifest, unioned and regex-filtered by `fleetSource.ts` — §4) into N live, connected, multi-EVSE
+stations. §4 covers *getting the data*; this section covers *using it to boot the fleet* — the gap
+the file-layout table (§9) only gestured at ("wires `fleetSource.ts` → spawns `Station`s →
+starts `console.ts`").
+
+`qa/run.ts`'s job, in order:
+
+```ts
+const specs = await loadFleet();          // qa/fleetSource.ts — §4, already filtered
+const registry = new Map<string, Station>();
+for (const spec of specs) {
+  registry.set(spec.id, new Station(spec)); // qa/station.ts — §6.1, connectors built from spec.evses
+}
+await connectFleet(registry, CONFIG.staggerSeconds); // this section
+startConsole(registry);                    // qa/console.ts — §7
+```
+
+#### CPMS authentication/authorization failures (`loadFleet()`, before any station connects)
+
+This happens once, inside `qa/fleetSource.ts`'s call into `qa/onceProvider.ts` (§4b) — *before*
+`qa/run.ts` even builds the `Station` registry, let alone starts connecting anything. It's a
+categorically different failure from the per-station WS failures below: one credential drives one
+paginated REST fetch, so an auth failure there takes out the *entire* CPMS-sourced contribution to
+the fleet in one shot, not one station out of many.
+
+Confirmed against `obornes-cpo-backbone`'s actual guard/middleware source
+(`src/public-api/guard/public-api.guard.ts`, `src/multitenancy/middleware/tenant-context.middleware.ts`)
+— exact response shapes below, not guessed:
+
+| Cause | HTTP status | Body |
+|---|---|---|
+| `ONCE_API_KEY` missing/empty | 401 | empty |
+| Key not found in DB (typo, wrong environment, revoked) | 401 | empty |
+| Key expired | 401 | empty — the server also soft-deletes the key row on this call (`deletedAt` set), so every subsequent retry with the same key gets the identical 401, not just the first |
+| Key valid but lacks `ChargingStation.Read` | 403 | `{ message, error: { message: "Missing required permission: ChargingStation.Read", requiredPermission } }` |
+| Multitenant environment (`MULTITENANCY_REJECT_ON_MISSING_TENANT=true`) and no `ONCE_API_TENANT_ID` sent | 400 | `"Missing X-Tenant-Id header"` |
+| `ONCE_API_TENANT_ID` set to an unknown slug, or a tenant that exists but isn't `ACTIVE` | 401 | empty — deliberately the *same* shape as a bad key: `TenantContextMiddleware`'s own doc comment calls this anti-enumeration, so the response never reveals whether the slug exists |
+
+All six are **terminal, not retryable** — none are fixed by trying again, unlike a mid-pagination
+network blip (transient, worth the bounded retry §8.2's loop already implies).
+`qa/onceProvider.ts` must treat any 4xx from this endpoint as terminal for the current run and stop
+paginating immediately — it must not loop back into `fetchPage` for the next page after any 4xx.
+
+Because the API deliberately returns an identical 401 for "bad key", "expired key", and "unknown/
+inactive tenant" (anti-enumeration — confirmed in the middleware's own comments), `qa/onceProvider.ts`
+cannot disambiguate those three from the HTTP response alone. The operator-facing message must say so
+rather than guessing which one it is:
+
+```
+[qa] CPMS fetch failed: 401 Unauthorized from ONCE_API_URL.
+     Check ONCE_API_KEY (unset / wrong / expired) and, if this environment has multitenancy
+     enabled, ONCE_API_TENANT_ID (unset / wrong slug / tenant not ACTIVE) — the CPMS API
+     returns an identical 401 for all of these on purpose, to avoid leaking which one it is.
+```
+
+The 403 and 400 cases are unambiguous and get a precise message instead, built from the response body
+(`error.requiredPermission` for the 403, the literal string for the 400):
+
+```
+[qa] CPMS fetch failed: 403 Forbidden — ONCE_API_KEY lacks the "ChargingStation.Read" permission.
+[qa] CPMS fetch failed: 400 Bad Request — "Missing X-Tenant-Id header". This CPMS environment
+     requires ONCE_API_TENANT_ID to be set.
+```
+
+**Not the same case as §4b's "if unconfigured" no-op.** §4b already says a *missing*
+`ONCE_API_URL`/`ONCE_API_KEY` makes the CPMS source silently contribute an empty list, no request
+attempted, no error — that's the expected shape for "this operator only wants the static manifest."
+An auth failure is the opposite situation: credentials **are** configured, and the CPMS actively
+rejected them. Silently falling through to an empty CPMS contribution here would look identical to
+the intentional no-op case in the resulting fleet size, which is exactly the confusing outcome to
+avoid — an operator staring at a suspiciously small or empty fleet with no idea whether they simply
+didn't configure CPMS, or configured it wrong. So `qa/fleetSource.ts` logs the failure at error level
+(loud, `C.red`/`C.bold`-styled the same way `demo/`'s `Shutting down`/`Reset requested` banners are —
+`qa/stats.ts` defines its own copy of `demo/stats.ts`'s `C` palette, independent file per §9) — never
+silently swallowed like the genuinely-unconfigured case.
+
+**Does not abort the whole run.** Consistent with §4's "each source degrades independently" and this
+section's own failure-isolation stance for station connections: if a static manifest (§4a) is *also*
+configured, `qa/run.ts` still starts and connects those stations normally — only the CPMS-sourced
+portion of the fleet is missing, with the loud error above explaining why, so the operator can keep
+working against their manifest while fixing the credential. If CPMS was the *only* configured source,
+the union is empty and the fleet is empty — same terminal state §4c already describes for "nothing
+configured", but now reached via the error-level log above instead of silently, so it's
+distinguishable in the startup output.
+
+#### Connection fan-out: staggered, not simultaneous
+
+Opening `specs.length` WebSocket connections in one tick (`Promise.all(specs.map(s => s.connect()))`)
+is exactly what `demo/config.ts`'s `STAGGER_SECONDS` / `demo/simulate-network.ts`'s per-station random
+delay already exist to avoid — a connection storm against the CSMS/CPMS's OCPP endpoint, and
+(worse here, since ONCE-sourced fleets can be considerably larger than a hand-written manifest — §4b's
+`limit: 1000` per page, looped) a thundering herd of simultaneous `BootNotification`s. `qa/run.ts`
+reuses the identical pattern, unchanged in shape:
+
+```ts
+// qa/run.ts — modeled directly on demo/simulate-network.ts's stagger loop
+async function connectFleet(registry: Map<string, Station>, staggerSeconds: number): Promise<void> {
+  const stations = Array.from(registry.values());
+  for (const station of stations) {
+    const delay = Math.random() * staggerSeconds * 1000;
+    setTimeout(() => {
+      if (!shuttingDown) station.connect();
+    }, delay);
+  }
+}
+```
+
+Each `station.connect()` is fire-and-forget and self-contained (own `WebSocket`, own retry loop —
+§6.1's `ConnectionState`) — the loop above never `await`s a connection succeeding before starting the
+next station's timer, so one station's slow TLS handshake or CPMS-side auth hiccup can't delay any
+other station's connection attempt. This is the same reasoning §4's "each source degrades to a safe
+no-op" and §6.1's "per-connector, not per-station, session state" follow: no single slow/failing part
+of the fleet should block or corrupt any other part.
+
+`staggerSeconds` follows `demo/config.ts`'s convention exactly — default scales with fleet size
+(`max(10, ceil(stationCount * 0.09))`, i.e. roughly 9% of the fleet connects per second at the default
+rate) rather than a fixed constant, since a 5-station manifest and a 3000-station ONCE-sourced fleet
+need very different spread — configurable via `STAGGER_SECONDS` in `qa/config.ts` (§8.4), overridable
+per run the same way `demo/`'s is.
+
+#### Per-station boot sequence: connect → `BootNotification` → one `StatusNotification` per connector
+
+Mirrors `demo/station.ts`'s existing `connect()` → `ws.on("open")` → `sendBootNotification()` chain
+(`demo/station.ts:83-98,388`), extended from "one connector" to "loop `station.connectors.values()`"
+per §6.1's boot-sequence bullet:
+
+```ts
+// qa/station.ts — connect(), same shape as demo/station.ts:connect(), connector loop is the only delta
+connect(): void {
+  if (this.destroyed) return;
+  this.state = "connecting";
+  this.ws = new WebSocket(`${CONFIG.wsUrl}/${this.spec.id}`, [protocolFor(this.spec.ocppVersion)]);
+  this.ws.on("open", async () => {
+    await this.sendBootNotification();               // single call, station-wide
+    for (const c of this.connectors.values()) {
+      await this.sendStatusNotification(c.evseId, c.connectorId, "Available"); // §6.1, omits evseId on 1.6
+    }
+    this.state = "connected";
+  });
+  this.ws.on("close", () => { this.cleanup(); if (!this.destroyed && !this.intentionalDisconnect) this.scheduleReconnect(); });
+  this.ws.on("error", () => { /* close fires after error, same as demo/station.ts:112-114 */ });
+}
+```
+
+A station only reports `"connected"` once every connector's boot `StatusNotification` has been sent —
+`status <stationId>` (§7.3) reflects `"connecting"` for a station still mid-boot, which is expected and
+normal during the stagger window, not an error state.
+
+#### Failure isolation: one station's connect failure never aborts the fleet
+
+`connectFleet` above deliberately never `Promise.all`s station connections to completion, for the same
+reason `demo/station.ts:scheduleReconnect` exists per-station: a CPMS-sourced fleet can legitimately
+contain a station that's currently offline/decommissioned in the real world (its ONCE record still
+exists, but nothing accepts the WebSocket) — that one entry retrying forever with jittered backoff
+(`demo/station.ts`'s existing `randomBetween(CONFIG.reconnectMinMs, CONFIG.reconnectMaxMs)`, reused
+as-is in `qa/station.ts`) must never prevent the other N-1 stations from booting or the console from
+starting. `qa/run.ts` starts `qa/console.ts` (§7) immediately after scheduling all connection timers,
+not after awaiting them — `list`/`status` simply show `"connecting"`/`"disconnected"` for stations
+still mid-retry, which is live, correct information, not a startup gate.
+
+#### Progress/readiness reporting
+
+`qa/stats.ts` (§9) tracks and periodically prints (same cadence idea as
+`demo/simulate-network.ts:142-147`'s first-stats-after-stagger-period print) a connected-vs-total
+count — `connected: 847/1000 (312 EVSEs, 1189 connectors booted)` — so a large ONCE-sourced fleet's
+ramp-up is observable without polling every station individually via `status`. This is purely
+informational (log output), not a blocking readiness gate: there's no "wait until N are connected"
+step anywhere in `qa/run.ts` — the console (§7) and any script's `sleep`/scenario commands are always
+free to run against a partially-connected fleet, exactly as `demo/`'s hotkeys already are during its
+own stagger window today.
+
 ## 7. Console / CLI
 
 Goal: script fleet operations or drive them by hand, against the **same live objects** the fleet
@@ -555,18 +744,18 @@ Env vars, following this repo's existing `.env`/`start.sh` convention (same patt
 `CP_ID`, `PASSWORD`). Each answers a different question the CPMS provider (§4b) needs to make its
 `POST /_external/api/v1/charging-stations/rsql-list` call:
 
-- **`CPMS_API_URL`** — *where* to send the request. Base URL up to and including `/_external/api/v1`
+- **`ONCE_API_URL`** — *where* to send the request. Base URL up to and including `/_external/api/v1`
   (e.g. `https://<host>/_external/api/v1`), so the provider just appends
   `/charging-stations/rsql-list`. Changes per environment (local / sandbox / a given client's CPMS) —
   never hardcoded, exactly like `WS_URL` isn't hardcoded for the OCPP connection today.
-- **`CPMS_API_KEY`** — *with what authorization*. Sent as the `x-api-key` header on every request.
+- **`ONCE_API_KEY`** — *with what authorization*. Sent as the `x-api-key` header on every request.
   Without it, `PublicApiGuard` on the `obornes-cpo-backbone` side rejects the call with
   `401 Unauthorized` before it does anything else (see the guard's own checks: key present → key
   found in DB → not expired → carries the `ChargingStation.Read` permission). This is a *separate*
   credential from the OCPP `PASSWORD` this repo already uses — one authenticates the WebSocket/OCPP
   session with a charge point identity, the other authenticates a REST call against the CPMS's own
   API, as two unrelated systems.
-- **`CPMS_API_TENANT_ID`** — *for which tenant*. Sent as the `X-Tenant-Id` header. Optional: only
+- **`ONCE_API_TENANT_ID`** — *for which tenant*. Sent as the `X-Tenant-Id` header. Optional: only
   required when the target `obornes-cpo-backbone` environment has `MULTITENANCY_SUPPORT_ENABLED=true`
   (its `CLAUDE.md` documents this flag) — a single CPMS deployment can serve several
   tenants/operators, each with its own station registry, so the API needs to know which one to query.
@@ -645,7 +834,7 @@ files.
 | `qa/station.ts` | The connector-aware `Station` class (§6.1) — new, not derived from `demo/station.ts` by import or inheritance. |
 | `qa/charging.ts` | Per-connector session start/stop/abort logic (§6.1), same shape as `demo/charging.ts` but keyed by `connectorId` from the start. |
 | `qa/manifest.ts` | Zod schema for `StationSpec` (§5) and the explicit-list provider (§4a) — parses/validates a JSON manifest into `StationSpec[]`. |
-| `qa/cpmsProvider.ts` | The CPMS-fetched provider (§4b): builds the (optionally status/version-narrowed) RSQL request, paginates (§8.2), maps `ocppVersion`/`chargingPoints` into `StationSpec[]` (both gotchas from §4b) — always produces the explicit `evses` form (§5.1) from `chargingPoints[].ocppEvseId`/`.connectors`, never `connectorCount`, since the real topology is already on hand. No id-based filtering here, that's `regexFilter.ts`'s job. |
+| `qa/onceProvider.ts` | The CPMS-fetched provider (§4b): builds the (optionally status/version-narrowed) RSQL request, paginates (§8.2), maps `ocppVersion`/`chargingPoints` into `StationSpec[]` (both gotchas from §4b) — always produces the explicit `evses` form (§5.1) from `chargingPoints[].ocppEvseId`/`.connectors`, never `connectorCount`, since the real topology is already on hand. No id-based filtering here, that's `regexFilter.ts`'s job. |
 | `qa/regexFilter.ts` | The include/exclude regex pass (§4c, §5.3, §8.3) — loads/merges the include and exclude pattern lists (file + CLI), applies both to whatever `StationSpec[]` either source produced. |
 | `qa/fleetSource.ts` | Always gathers from both sources (§4a, §4b — each independently empty if unconfigured, not an error), unions them, runs the union through `regexFilter.ts` (§4c), and returns a final `StationSpec[]`. Not a "pick one" switch — all three mechanisms (§4) run every time. |
 | `qa/console.ts` | The `readline` REPL + command dispatcher (§7): `parseCommand`, `dispatch`, and the command table's implementations. Calls into `qa/scenarios.ts` for the `scenario <name>` command. |
@@ -653,7 +842,7 @@ files.
 | `qa/config.ts` | Env-var-driven `CONFIG` + default behavior profile (§8.4) — same pattern as `demo/config.ts`, independent file. |
 | `qa/stats.ts` | Aggregate counters / logging helpers — same pattern as `demo/stats.ts`, independent file. |
 | `qa/types.ts` | `ConnectorRuntime`, `StationSpec`, command-related shared types. |
-| `qa/run.ts` | Entry point — wires `fleetSource.ts` → spawns `Station`s → starts `console.ts`. Analogous role to `demo/simulate-network.ts`. |
+| `qa/run.ts` | Entry point — wires `fleetSource.ts` → spawns `Station`s → staggers connections → starts `console.ts` (§6.2). Analogous role to `demo/simulate-network.ts`. |
 | `qa/README.md` | Documents the manifest format, `CPMS_API_*` env vars, and the console command table — same spirit as `demo/README.md`. |
 
 **Non-code additions:** a `qa/manifests/` directory for example/sample manifest and include/exclude
