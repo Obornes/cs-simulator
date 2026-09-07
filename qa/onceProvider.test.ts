@@ -101,6 +101,49 @@ describe("fetchOnceFleet", () => {
     ]);
   });
 
+  test("maps chargingPool into StationSpec.pool when present", async () => {
+    mockFetch(() =>
+      jsonResponse(200, {
+        data: [
+          {
+            ocppChargingStationId: "SIM-0001",
+            ocppVersion: "OCPP_2_0_1",
+            chargingPoints: [
+              { ocppEvseId: 1, connectors: [{ ocppConnectorId: 1 }] },
+            ],
+            chargingPool: { id: "SITE-42", name: "Site 42" },
+          },
+        ],
+        pagination: { next: null },
+      }),
+    );
+
+    const result = await fetchOnceFleet();
+
+    assert.deepEqual(result[0].pool, { id: "SITE-42", name: "Site 42" });
+  });
+
+  test("leaves pool unset when chargingPool is absent (existing behavior, unchanged)", async () => {
+    mockFetch(() =>
+      jsonResponse(200, {
+        data: [
+          {
+            ocppChargingStationId: "SIM-0001",
+            ocppVersion: "OCPP_2_0_1",
+            chargingPoints: [
+              { ocppEvseId: 1, connectors: [{ ocppConnectorId: 1 }] },
+            ],
+          },
+        ],
+        pagination: { next: null },
+      }),
+    );
+
+    const result = await fetchOnceFleet();
+
+    assert.equal("pool" in result[0], false);
+  });
+
   test("paginates until pagination.next is null", async () => {
     const calls = mockFetch((call) => {
       const page = new URL(call.url).searchParams.get("page");

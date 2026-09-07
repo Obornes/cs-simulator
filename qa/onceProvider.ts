@@ -25,10 +25,19 @@ const OnceChargingPointSchema = z.object({
   connectors: z.array(OnceConnectorSchema),
 });
 
+const OnceChargingPoolSchema = z.object({
+  id: z.string().min(1),
+  name: z.string().optional(),
+});
+
 const OnceChargingStationSchema = z.object({
   ocppChargingStationId: z.string().min(1),
   ocppVersion: z.string().optional(),
   chargingPoints: z.array(OnceChargingPointSchema),
+  // Always present on the real CPMS response (confirmed non-optional in
+  // ChargingStationWithChargingPoolDto), but kept optional here defensively so a station
+  // missing it in some edge case degrades to "no pool" rather than being skipped outright.
+  chargingPool: OnceChargingPoolSchema.optional(),
 });
 
 const OncePaginatedResultSchema = z.object({
@@ -164,6 +173,11 @@ function mapStation(raw: OnceChargingStation): StationSpec | null {
     id: raw.ocppChargingStationId,
     ocppVersion,
     evses,
+    // Conditional spread, not `pool: raw.chargingPool` — see this task's header gotcha:
+    // explicitly passing `pool: undefined` would add an own `pool` key to the parsed
+    // result even when chargingPool is absent, breaking every deepEqual test that expects
+    // no pool key at all.
+    ...(raw.chargingPool ? { pool: raw.chargingPool } : {}),
   });
   if (!result.success) {
     logger.warn(
