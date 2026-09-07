@@ -137,3 +137,6 @@ dist
 CLAUDE.md
 tf-modules/
 deploy/cs-simulator/sdbx/.terraform/
+
+# Subagent-driven-development scratch workspaces
+.superpowers/
