@@ -19,12 +19,18 @@ const EvseSpecSchema = z.object({
   connectorIds: z.array(z.number().int().positive()).min(1),
 });
 
+const PoolSpecSchema = z.object({
+  id: z.string().min(1), // chargingPool.id from the CPMS (§4b) — opaque grouping key, not OCPP
+  name: z.string().optional(), // chargingPool.name — display only
+});
+
 const StationSpecInputSchema = z
   .object({
     id: z.string().min(1), // ocppChargingStationId — used verbatim as CP_ID
     ocppVersion: z.nativeEnum(OcppVersion),
     connectorCount: z.number().int().positive().optional(), // shorthand — see docs/fleet-loader-spec.md §5.1
     evses: z.array(EvseSpecSchema).min(1).optional(), // explicit real topology
+    pool: PoolSpecSchema.optional(), // §4b for ONCE-sourced stations; hand-authored in a manifest, or omitted
   })
   .merge(BehaviorOverridesSchema)
   .refine((s) => (s.connectorCount === undefined) !== (s.evses === undefined), {

@@ -58,6 +58,46 @@ describe("StationSpecSchema", () => {
       }),
     );
   });
+
+  test("accepts an optional pool with id and name", () => {
+    const result = StationSpecSchema.parse({
+      id: "SIM-0001",
+      ocppVersion: OcppVersion.OCPP_1_6,
+      connectorCount: 1,
+      pool: { id: "SITE-42", name: "Site 42" },
+    });
+    assert.deepEqual(result.pool, { id: "SITE-42", name: "Site 42" });
+  });
+
+  test("accepts a pool with only an id (no name)", () => {
+    const result = StationSpecSchema.parse({
+      id: "SIM-0002",
+      ocppVersion: OcppVersion.OCPP_1_6,
+      connectorCount: 1,
+      pool: { id: "SITE-42" },
+    });
+    assert.deepEqual(result.pool, { id: "SITE-42" });
+  });
+
+  test("pool is absent (not just undefined) from the parsed result when not given", () => {
+    const result = StationSpecSchema.parse({
+      id: "SIM-0003",
+      ocppVersion: OcppVersion.OCPP_1_6,
+      connectorCount: 1,
+    });
+    assert.equal("pool" in result, false);
+  });
+
+  test("rejects a pool with an empty id", () => {
+    assert.throws(() =>
+      StationSpecSchema.parse({
+        id: "SIM-0004",
+        ocppVersion: OcppVersion.OCPP_1_6,
+        connectorCount: 1,
+        pool: { id: "" },
+      }),
+    );
+  });
 });
 
 describe("loadExplicitList", () => {
