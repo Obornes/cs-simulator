@@ -1,4 +1,8 @@
+import { parseArgs } from "node:util";
+import { loadCommands } from "./commands";
+import type { CommandContext } from "./commands/command";
 import { CONFIG, resolveStaggerSeconds } from "./config";
+import { runExecLines, startInteractiveConsole } from "./console";
 import { loadFleetFromConfig } from "./loadFleetFromConfig";
 import { connectFleet } from "./orchestrate";
 import { Station } from "./station";
@@ -9,13 +13,19 @@ const PROGRESS_INTERVAL_MS = 15_000;
 let shuttingDown = false;
 
 async function main(): Promise<void> {
+  const { values } = parseArgs({
+    args: process.argv.slice(2),
+    options: { exec: { type: "string", multiple: true, default: [] } },
+    strict: false,
+  });
+  const execLines = values.exec as string[];
+
   const specs = await loadFleetFromConfig();
   if (specs.length === 0) {
     logInfo(
       "qa",
       "No stations to simulate — configure MANIFEST_FILE and/or ONCE_API_URL/ONCE_API_KEY.",
     );
-    return;
   }
 
   const stations = specs.map((spec) => new Station(spec));
@@ -32,8 +42,6 @@ async function main(): Promise<void> {
     PROGRESS_INTERVAL_MS,
   );
 
-  // §7's console isn't built yet — for now this just keeps the process alive and reports
-  // progress until interrupted.
   const shutdown = (): void => {
     if (shuttingDown) {
       return;
@@ -48,6 +56,11 @@ async function main(): Promise<void> {
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
+
+  const commands = await loadCommands();
+  const context: CommandContext = { stations, shutdown };
+  await runExecLines(execLines, context, commands);
+  startInteractiveConsole(context, commands);
 }
 
 main().catch((err) => {
