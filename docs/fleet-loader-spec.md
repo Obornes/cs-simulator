@@ -15,7 +15,11 @@ Status: draft. Consolidates a design discussion. Implemented so far:
   `SIGINT`/`SIGTERM`.
 
 All with tests (`npm run check`). Everything else (§7 console, §9's remaining files) is still
-unimplemented design.
+unimplemented design — including §7's own first scoped-down iteration: a minimal console (readline
+wiring + `--exec`, §7.2), an auto-discovering command registry (§7.6), and exactly one real command,
+`list`, with its `--connection-status`/`--connector-status`/`--pool-id`/`--protocol` filters (§7.3.1)
+and the new `StationSpec.pool` field it depends on (§5.1). Every other command in §7.3's table stays
+design-only for now.
 
 Lives in a new, independent top-level `qa/` directory — not inside `demo/`. `demo/` is left
 untouched: it keeps serving its original purpose (broad network/chaos load testing). `qa/` is a
@@ -103,6 +107,10 @@ Fetched from `obornes-cpo-backbone`'s public API. Contract confirmed by reading 
   - `status: ChargingStationStatus`
   - `ocppVersion: string`
   - `chargingPoints: ChargingPointDto[]` — each has `ocppEvseId: number` and `connectors: [...]`.
+  - `chargingPool: ChargingPoolDto` — **always present, never optional** (confirmed by reading
+    `ChargingStationWithChargingPoolDto` in `obornes-cpo-backbone`). Only `id`/`name` are used here,
+    mapped into `StationSpec.pool` (§5.1) — the rest of `ChargingPoolDto` (address, GPS, tags, ...) is
+    out of scope for this loader.
 
 **If unconfigured:** the CPMS source requires **both** `ONCE_API_URL` and `ONCE_API_KEY` (§8.1) to
 make a call at all — if either is missing, this source contributes an empty list, no request is
@@ -210,12 +218,18 @@ const EvseSpecSchema = z.object({
   connectorIds: z.array(z.number().int().positive()).min(1),
 });
 
+const PoolSpecSchema = z.object({
+  id: z.string().min(1), // chargingPool.id from the CPMS (§4b) — opaque grouping key, not OCPP
+  name: z.string().optional(), // chargingPool.name — display only
+});
+
 const StationSpecInputSchema = z
   .object({
     id: z.string().min(1), // ocppChargingStationId — used verbatim as CP_ID
     ocppVersion: z.nativeEnum(OcppVersion), // reuses this repo's enum directly — no duplicated literals
     connectorCount: z.number().int().positive().optional(), // shorthand — see above
     evses: z.array(EvseSpecSchema).min(1).optional(), // explicit real topology — see above
+    pool: PoolSpecSchema.optional(), // §4b for ONCE-sourced stations; hand-authored in a manifest, or omitted entirely
   })
   .merge(BehaviorOverridesSchema)
   .refine((s) => (s.connectorCount === undefined) !== (s.evses === undefined), {
@@ -241,6 +255,13 @@ export type StationSpec = z.infer<typeof StationSpecSchema>;
 Behavior knobs are optional and stay `undefined` when absent — §8.4's fallback to `qa/config.ts`'s
 `CONFIG` happens at the point `qa/station.ts` reads them, not inside this schema (the schema's job is
 only "is this shape valid", not "what's the effective value").
+
+`pool` is optional for the same reason §4a's provider has no natural source for it: a hand-written
+manifest entry can set `pool: { id: "SITE-42", name: "Test bench A" }` to group its own stations for
+filtering (§7.3.1), or omit it entirely. `qa/onceProvider.ts` (§4b) always sets it, since
+`chargingPool` is never absent on the CPMS response — every ONCE-sourced `StationSpec` carries a real
+`pool.id`. A station with no `pool` set (manifest-only, no override) reports `N/A` for its pool column
+in `list`'s output (§7.3.1) and never matches an active `--pool-id` filter.
 
 ### 5.2 Manifest file format (`qa/manifest.ts`, static provider §4a)
 
@@ -633,9 +654,40 @@ is shared by:
   (`npx tsx qa/run.ts --script scenario.txt`, or piped via stdin so it also works as
   `cat scenario.txt | npx tsx qa/run.ts`). `sleep`/`repeat` (below) let a script pace itself instead
   of firing everything at once.
+- **`--exec "<line>"`** — a third, repeatable way to feed the exact same dispatcher, this time straight
+  from the process's own `argv` rather than a file or stdin: `--exec "list --connector-status=charging"
+  --exec "spawn 5"` runs both, in the order given, before anything else described below. No new command
+  syntax — each `--exec` value is just one line, parsed and dispatched exactly as if it had been typed
+  at the `fleet>` prompt or read from a script file.
 
-Neither mode re-implements fleet logic — both just feed lines into the same dispatcher, which talks
-directly to the in-memory `Map<stationId, Station>` registry the runner already holds.
+Neither mode re-implements fleet logic — all three just feed lines into the same dispatcher, which
+talks directly to the in-memory `Map<stationId, Station>` registry the runner already holds.
+
+#### What happens after `--exec` finishes — no `--repl`/`--exit` flag needed
+
+Once every `--exec` line has run, `qa/run.ts` falls straight through into the console startup code
+below, completely unchanged — no branching on "did `--exec` run" anywhere. What the operator sees next
+is entirely a function of stdin's real state at that point, which was already true before `--exec`
+existed:
+
+- **stdin is a TTY** — the `fleet> ` prompt appears and stays interactive, same as running with no
+  flags at all. Handy default: `--exec "list --connector-status=charging"` from an interactive
+  terminal runs the query, then hands control straight to the prompt.
+- **stdin is a pipe/file with more lines left** — those lines keep feeding the dispatcher as scripted
+  commands (already-documented "piped mode" above), `--exec` lines having simply run first.
+- **stdin is already at EOF** (`< /dev/null`, or nothing piped in) — `readline`'s `"close"` event fires
+  immediately, without ever prompting. Nothing breaks; there's just no more console input to read.
+
+None of this needs a `--repl` flag — it's the existing, already-specified console startup behavior,
+reused as-is. It also doesn't make the process exit on its own: the fleet's live WebSocket connections
+and timers keep Node running regardless of whether stdin has anything left to give. For a genuine
+one-shot invocation (run a query, then terminate — e.g. from a CI script), no `--exit` flag is needed
+either: just make the last `--exec` line one of the already-specified `quit`/`exit`/`q` commands
+(§7.3), which triggers the existing graceful-shutdown path:
+
+```bash
+npx tsx qa/run.ts --exec "list --connector-status=charging" --exec "quit"
+```
 
 #### Why `readline`, not the current raw-mode input
 
@@ -695,7 +747,7 @@ raw-mode single-keystroke input.
 
 | Command | Args | Effect |
 |---|---|---|
-| `list [--status=<state>] [--protocol=<ocpp1.6\|ocpp2.0.1>]` | optional filters | Print matching station IDs + state (`available`/`charging`/`disconnected`/...) |
+| `list [--connection-status=<v,...>] [--connector-status=<v,...>] [--pool-id=<v,...>] [--protocol=<v,...>]` | optional filters, all combinable | Print one line per matching `(station, connector)` — see §7.3.1 for filter/output semantics. **Implemented this iteration**; every other command below is still design-only. |
 | `status <stationId>` | station ID | Full state dump: protocol, connection state, one line per connector (idle / session id, idTag, elapsed, energy so far) |
 | `stats` | — | Aggregate counters — `qa/stats.ts`, modeled after `demo/stats.ts`'s existing tracked stats |
 | `connect <stationId>` | station ID | Force-(re)connect a specific station |
@@ -713,6 +765,56 @@ raw-mode single-keystroke input.
 
 Unknown commands or bad arguments print a usage error and continue (a typo in a script shouldn't
 kill the whole run).
+
+### 7.3.1 `list`: filter and output semantics
+
+Three station/connector attributes are filterable, each via its own flag, each accepting a
+comma-separated list of values (no spaces): `--connection-status=<v,...>`,
+`--connector-status=<v,...>`, `--pool-id=<v,...>`. The pre-existing `--protocol=<v,...>` (§7.3) is a
+fourth, same shape. Combination rule, stated plainly:
+
+- **Within one flag: OR.** `--connector-status=charging,preparing` keeps a connector if it's in
+  *either* state.
+- **Across flags: AND.** `--connection-status=connected --connector-status=charging` keeps only rows
+  where the station is connected *and* that specific connector is charging — a `charging` connector on
+  a `disconnected` station's stale state (§6.1: connectors don't reset just because the socket
+  dropped) does **not** match.
+- **Omitted flag: no-op**, exactly like §4c's include/exclude filters — a flag that isn't given never
+  excludes anything, it simply doesn't participate in the AND.
+- With no flags at all, `list` prints every connector of every station.
+
+**Why comma-separated values, not repeated flags:** `--connector-status=charging,preparing` was chosen
+over `--connector-status=charging --connector-status=preparing` — one flag occurrence per dimension
+keeps a line easy to scan, and matches §8.3's existing `--include <regex,...>` convention.
+
+**Why `--connection-status`/`--connector-status`/`--pool-id`, not shorter names:** verbose over terse,
+specifically so future filters read as a consistent family —`--connector-id=<v,...>`,
+`--pool-name=<v,...>`, `--evse-id=<v,...>` are the obvious next additions, and the
+`--<entity>-<attribute>` shape leaves no ambiguity about which entity a new flag filters on before it's
+ever implemented.
+
+**Output — one line per `(station, connector)`, fixed columns regardless of protocol:**
+
+```
+STATION       EVSE  CONNECTOR  CONN-STATUS  CONNECTOR-STATUS  PROTOCOL     POOL
+SIM-0007      N/A   1          connected    charging          OCPP_1.6     N/A
+SIM-0007      N/A   2          connected    available         OCPP_1.6     N/A
+MULTI-0001    1     1          connecting   available         OCPP_2.0.1   N/A
+MULTI-0001    2     1          connecting   available         OCPP_2.0.1   N/A
+MULTI-0001    2     2          connecting   available         OCPP_2.0.1   N/A
+ONCE-0042     3     1          connected    preparing         OCPP_2.0.1   Site 42
+```
+
+`SIM-0007` and `MULTI-0001` are exactly the §5.2 manifest examples (all 3 of `MULTI-0001`'s connectors
+shown, one row each) — neither sets `pool`, hence `N/A`. `ONCE-0042` illustrates an ONCE-sourced station
+(§4b), whose `pool.name` (`"Site 42"`) is always populated by `qa/onceProvider.ts`.
+
+Every row has every column — no conditional layout per protocol. `EVSE` is `N/A` for OCPP 1.6 stations
+(§5.1: `evseId` is an internal label there, never real topology) rather than printing the placeholder
+`1` every `connectorCount`-shorthand station gets internally, which would look like real data it isn't.
+`POOL` is `N/A` for any station whose `StationSpec.pool` is unset (manifest-only stations that didn't
+opt in — see §5.1). Prints the pool's `name` when set, falling back to `id` when a manifest supplied
+only an `id`.
 
 ### 7.4 Example script
 
@@ -735,6 +837,51 @@ No pipes, variables, or conditionals — this is a flat command list, not a shel
 real branching logic, that belongs in a new `qa/scenarios.ts` entry (TypeScript), not the command
 script. The parser is intentionally simple: whitespace-tokenize a line, validate args per command
 with the same Zod-first convention used elsewhere in this repo.
+
+### 7.6 Command extensibility — one file per command, auto-discovered
+
+Mirrors this repo's existing pattern for OCPP actions (`CLAUDE.md`: "one file per action... register it
+in the appropriate map") rather than growing one large `switch` in a dispatcher — same shape, applied
+to console commands instead of OCPP messages:
+
+- **`qa/commands/command.ts`** — an abstract base class every command extends:
+  ```ts
+  export abstract class Command {
+    abstract readonly name: string;   // the word typed at the prompt, e.g. "list"
+    abstract readonly usage: string;  // one-line help text, printed by the `help` command
+    abstract execute(args: string[], registry: Map<string, Station>): void | Promise<void>;
+  }
+  ```
+- **`qa/commands/list.ts`** (this iteration), and later `qa/commands/status.ts`,
+  `qa/commands/connect.ts`, etc. — one file per command, each a single class extending `Command`,
+  default-exported.
+- **`qa/commands/index.ts`** — no hand-maintained map. At startup it reads its own directory
+  (`node:fs`'s `readdirSync(__dirname)`), dynamically `import()`s every file except `command.ts`
+  itself, and instantiates each file's default export, keyed by its `.name`:
+  ```ts
+  const COMMANDS: Record<string, Command> = {};
+  for (const file of readdirSync(__dirname)) {
+    if (file === "command.ts" || file === "index.ts") continue;
+    const { default: CommandClass } = await import(`./${file}`);
+    const instance = new CommandClass();
+    COMMANDS[instance.name] = instance;
+  }
+  ```
+  `dispatch(line, registry)` (§7.2) tokenizes the line and looks up `COMMANDS[firstToken]` — the direct
+  analogue of `resolveMessageHandler`'s map lookup for OCPP actions.
+
+**Adding a command is then exactly one step:** drop a new file in `qa/commands/` extending `Command`.
+No edit to `index.ts`, `console.ts`, or any switch statement — the directory scan picks it up on the
+next run.
+
+**Trade-off, stated explicitly:** unlike the hand-written `ocppIncomingMessages`/`ocppOutgoingMessages`
+maps, "does this file actually export a valid `Command`" is checked at runtime (an `instanceof Command`
+assertion when instantiating), not at compile time by `tsc` — a malformed command file surfaces as a
+startup error, not a type error. Accepted for this feature: the alternative (decorators self-registering
+into a static array) doesn't actually remove the equivalent manual step, since a decorator only runs if
+its file is imported somewhere — that import list would just replace the map entry it was meant to
+avoid, while also introducing this repo's first use of decorators and requiring `experimentalDecorators`
+(currently disabled in `tsconfig.json`).
 
 ## 8. Decisions (formerly open questions)
 
@@ -837,11 +984,14 @@ files.
 | `qa/onceProvider.ts` | The CPMS-fetched provider (§4b): builds the (optionally status/version-narrowed) RSQL request, paginates (§8.2), maps `ocppVersion`/`chargingPoints` into `StationSpec[]` (both gotchas from §4b) — always produces the explicit `evses` form (§5.1) from `chargingPoints[].ocppEvseId`/`.connectors`, never `connectorCount`, since the real topology is already on hand. No id-based filtering here, that's `regexFilter.ts`'s job. |
 | `qa/regexFilter.ts` | The include/exclude regex pass (§4c, §5.3, §8.3) — loads/merges the include and exclude pattern lists (file + CLI), applies both to whatever `StationSpec[]` either source produced. |
 | `qa/fleetSource.ts` | Always gathers from both sources (§4a, §4b — each independently empty if unconfigured, not an error), unions them, runs the union through `regexFilter.ts` (§4c), and returns a final `StationSpec[]`. Not a "pick one" switch — all three mechanisms (§4) run every time. |
-| `qa/console.ts` | The `readline` REPL + command dispatcher (§7): `parseCommand`, `dispatch`, and the command table's implementations. Calls into `qa/scenarios.ts` for the `scenario <name>` command. |
+| `qa/console.ts` | The `readline` REPL wiring (§7.2): prompt/line handling, `--exec`/`--script` intake, and `dispatch(line, registry)` — tokenizes a line and routes it through `qa/commands/index.ts`'s registry. Does not itself implement any command's behavior. |
+| `qa/commands/command.ts` | Abstract `Command` base class (§7.6) every command extends: `name`, `usage`, `execute(args, registry)`. |
+| `qa/commands/list.ts` | The `list` command (§7.3.1) — this iteration's only implemented command. |
+| `qa/commands/index.ts` | Auto-discovers every file in `qa/commands/` (§7.6) and builds the `name -> Command` registry `dispatch()` consults. No hand-maintained map. |
 | `qa/scenarios.ts` | Scenario definitions (`SCENARIOS`, `findScenario`) — same idea as `demo/scenarios.ts`, adapted to operate on `qa/station.ts`'s connector-aware `Station` type. Does not import from `demo/`. |
 | `qa/config.ts` | Env-var-driven `CONFIG` + default behavior profile (§8.4) — same pattern as `demo/config.ts`, independent file. |
 | `qa/stats.ts` | Aggregate counters / logging helpers — same pattern as `demo/stats.ts`, independent file. |
-| `qa/types.ts` | `ConnectorRuntime`, `StationSpec`, command-related shared types. |
+| `qa/types.ts` | `ConnectorRuntime`, `StationSpec`, and other shared runtime types (not command-related — `Command` itself lives in `qa/commands/command.ts`, §7.6). |
 | `qa/run.ts` | Entry point — wires `fleetSource.ts` → spawns `Station`s → staggers connections → starts `console.ts` (§6.2). Analogous role to `demo/simulate-network.ts`. |
 | `qa/README.md` | Documents the manifest format, `CPMS_API_*` env vars, and the console command table — same spirit as `demo/README.md`. |
 
