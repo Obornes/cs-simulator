@@ -53,11 +53,14 @@ export function startInteractiveConsole(
   });
 
   rl.prompt();
-  rl.on("line", async (line) => {
+  rl.on("line", (line) => {
     rl.pause();
-    await dispatch(line, context, commands);
-    rl.prompt();
-    rl.resume();
+    dispatch(line, context, commands)
+      .catch((err) => console.log(`Command failed: ${err}`))
+      .finally(() => {
+        rl.prompt();
+        rl.resume();
+      });
   });
 
   return rl;

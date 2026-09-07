@@ -18,7 +18,14 @@ async function main(): Promise<void> {
     options: { exec: { type: "string", multiple: true, default: [] } },
     strict: false,
   });
-  const execLines = values.exec as string[];
+  const rawExec = values.exec ?? [];
+  const execLines = rawExec.filter((v): v is string => typeof v === "string");
+  if (execLines.length !== rawExec.length) {
+    logInfo(
+      "qa",
+      "Ignoring --exec flag(s) given without a value (e.g. a trailing --exec with nothing after it).",
+    );
+  }
 
   const specs = await loadFleetFromConfig();
   if (specs.length === 0) {
@@ -60,7 +67,9 @@ async function main(): Promise<void> {
   const commands = await loadCommands();
   const context: CommandContext = { stations, shutdown };
   await runExecLines(execLines, context, commands);
-  startInteractiveConsole(context, commands);
+  if (!shuttingDown) {
+    startInteractiveConsole(context, commands);
+  }
 }
 
 main().catch((err) => {

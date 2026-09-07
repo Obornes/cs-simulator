@@ -4,22 +4,27 @@ Status: draft. Consolidates a design discussion. Implemented so far:
 - §4 (both sources, unioned, plus the regex include/exclude pass) and §5.1/§5.2 (schemas) —
   `qa/manifest.ts`, `qa/onceProvider.ts`, `qa/regexFilter.ts`, `qa/fleetSource.ts`, `qa/config.ts`.
   `loadFleet()` takes optional `cliIncludePatterns`/`cliExcludePatterns` (§8.3's CLI-flag side) as
-  parameters rather than reading `process.argv` itself — no CLI parser exists yet.
+  parameters rather than reading `process.argv` itself — the `--include`/`--exclude` CLI flags
+  themselves still aren't wired up in `qa/run.ts`.
 - §6.1's connector-aware `Station` and its boot sequence, and §6.2's staggered connection
   fan-out/failure isolation/progress reporting — `qa/station.ts`, `qa/orchestrate.ts`, `qa/stats.ts`,
   `qa/run.ts`. **Not yet implemented**: any charging-session logic (§6.1's `tick()`,
   `startChargingSession`, `disconnectCheck`) or charge-point-initiated command handling
   (`RemoteStart/StopTransaction`, `RequestStart/StopTransaction` — every incoming Call is currently
-  answered with a `NotImplemented` CallError so the CSMS doesn't hang). `qa/run.ts` also doesn't start
-  §7's console yet (it doesn't exist) — it just connects the fleet and prints periodic progress until
-  `SIGINT`/`SIGTERM`.
+  answered with a `NotImplemented` CallError so the CSMS doesn't hang).
+- §7's own first scoped-down iteration: a minimal console — `node:readline` wiring plus the `--exec`
+  CLI flag (`parseArgs` in `qa/run.ts`, §7.2), quitting cleanly via `quit`/`exit`/`q` (§7.3) before
+  ever starting the interactive prompt — an auto-discovering command registry (§7.6,
+  `qa/commands/index.ts`'s `loadCommands()`), and exactly two real commands: `list`, with its
+  `--connection-status`/`--connector-status`/`--pool-id`/`--protocol` filters (§7.3.1) and the new
+  `StationSpec.pool` field it depends on (§5.1), and `quit`/`exit`/`q` (`qa/commands/quit.ts`) to
+  terminate the process. `qa/run.ts` wires it all together: load the fleet, connect it, run any
+  `--exec` lines through the dispatcher, then start the interactive console (skipped if `quit` already
+  fired during `--exec`).
 
-All with tests (`npm run check`). Everything else (§7 console, §9's remaining files) is still
-unimplemented design — including §7's own first scoped-down iteration: a minimal console (readline
-wiring + `--exec`, §7.2), an auto-discovering command registry (§7.6), and exactly one real command,
-`list`, with its `--connection-status`/`--connector-status`/`--pool-id`/`--protocol` filters (§7.3.1)
-and the new `StationSpec.pool` field it depends on (§5.1). Every other command in §7.3's table stays
-design-only for now.
+All with tests (`npm run check`). Every OTHER command in §7.3's table (`status`, `stats`, `connect`,
+`disconnect`, `reset`, `start`, `stop`, `scenario`, `spawn`, `remove`) remains design-only, as does
+`qa/scenarios.ts` and the rest of §9's unimplemented files.
 
 Lives in a new, independent top-level `qa/` directory — not inside `demo/`. `demo/` is left
 untouched: it keeps serving its original purpose (broad network/chaos load testing). `qa/` is a
@@ -846,12 +851,23 @@ to console commands instead of OCPP messages:
 
 - **`qa/commands/command.ts`** — an abstract base class every command extends:
   ```ts
+  export interface CommandContext {
+    stations: Station[];
+    shutdown: () => void;
+  }
+
   export abstract class Command {
     abstract readonly name: string;   // the word typed at the prompt, e.g. "list"
     abstract readonly usage: string;  // one-line help text, printed by the `help` command
-    abstract execute(args: string[], registry: Map<string, Station>): void | Promise<void>;
+    readonly aliases?: string[];      // extra words that route to the same command, e.g. "exit"/"q" -> "quit"
+    abstract execute(args: string[], context: CommandContext): void | Promise<void>;
   }
   ```
+  Deviates from an earlier draft of this section, which passed a bare `registry: Map<string, Station>`
+  directly: a plain `Station[]` matches what `qa/run.ts`/`qa/orchestrate.ts`/`qa/stats.ts` already use
+  (none of them key stations by a `Map`), and wrapping it in `CommandContext` leaves room to add more
+  capabilities later — like `shutdown` — without changing `Command`'s abstract `execute` signature
+  again for every future addition.
 - **`qa/commands/list.ts`** (this iteration), and later `qa/commands/status.ts`,
   `qa/commands/connect.ts`, etc. — one file per command, each a single class extending `Command`,
   default-exported.
@@ -985,8 +1001,9 @@ files.
 | `qa/regexFilter.ts` | The include/exclude regex pass (§4c, §5.3, §8.3) — loads/merges the include and exclude pattern lists (file + CLI), applies both to whatever `StationSpec[]` either source produced. |
 | `qa/fleetSource.ts` | Always gathers from both sources (§4a, §4b — each independently empty if unconfigured, not an error), unions them, runs the union through `regexFilter.ts` (§4c), and returns a final `StationSpec[]`. Not a "pick one" switch — all three mechanisms (§4) run every time. |
 | `qa/console.ts` | The `readline` REPL wiring (§7.2): prompt/line handling, `--exec`/`--script` intake, and `dispatch(line, registry)` — tokenizes a line and routes it through `qa/commands/index.ts`'s registry. Does not itself implement any command's behavior. |
-| `qa/commands/command.ts` | Abstract `Command` base class (§7.6) every command extends: `name`, `usage`, `execute(args, registry)`. |
-| `qa/commands/list.ts` | The `list` command (§7.3.1) — this iteration's only implemented command. |
+| `qa/commands/command.ts` | Abstract `Command` base class (§7.6) every command extends: `name`, `usage`, `execute(args, context)`, plus the `CommandContext` interface (`{ stations, shutdown }`). |
+| `qa/commands/list.ts` | The `list` command (§7.3.1) — first implemented command. |
+| `qa/commands/quit.ts` | Second implemented command, and the one `--exec '... ' --exec 'quit'` needs to actually terminate the process — see §7.2's `--exec` write-up. |
 | `qa/commands/index.ts` | Auto-discovers every file in `qa/commands/` (§7.6) and builds the `name -> Command` registry `dispatch()` consults. No hand-maintained map. |
 | `qa/scenarios.ts` | Scenario definitions (`SCENARIOS`, `findScenario`) — same idea as `demo/scenarios.ts`, adapted to operate on `qa/station.ts`'s connector-aware `Station` type. Does not import from `demo/`. |
 | `qa/config.ts` | Env-var-driven `CONFIG` + default behavior profile (§8.4) — same pattern as `demo/config.ts`, independent file. |

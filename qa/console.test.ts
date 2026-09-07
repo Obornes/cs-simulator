@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
+import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, test } from "node:test";
 import { Command, type CommandContext } from "./commands/command";
-import { dispatch, runExecLines } from "./console";
+import { dispatch, runExecLines, startInteractiveConsole } from "./console";
 
 class RecordingCommand extends Command {
   readonly name = "record";
@@ -59,5 +60,81 @@ describe("runExecLines", () => {
       new Map([["record", command]]),
     );
     assert.deepEqual(command.calls, [["1"], ["2"]]);
+  });
+});
+
+class ThrowingCommand extends Command {
+  readonly name = "boom";
+  readonly usage = "boom";
+  execute(): void {
+    throw new Error("kaboom");
+  }
+}
+
+describe("startInteractiveConsole", () => {
+  test("a throwing command does not crash the console or wedge the prompt", async () => {
+    const input = new PassThrough();
+    const output = new PassThrough();
+    const originalStdin = Object.getOwnPropertyDescriptor(process, "stdin");
+    const originalStdout = Object.getOwnPropertyDescriptor(process, "stdout");
+    Object.defineProperty(process, "stdin", {
+      value: input,
+      configurable: true,
+    });
+    Object.defineProperty(process, "stdout", {
+      value: output,
+      configurable: true,
+    });
+
+    const unhandledRejections: unknown[] = [];
+    const onUnhandledRejection = (err: unknown): void => {
+      unhandledRejections.push(err);
+    };
+    process.on("unhandledRejection", onUnhandledRejection);
+
+    const originalLog = console.log;
+    const logged: string[] = [];
+    console.log = (line: string) => {
+      logged.push(line);
+    };
+
+    let promptCount = 0;
+    const secondPrompt = new Promise<void>((resolve) => {
+      output.on("data", (chunk: Buffer) => {
+        if (chunk.toString().includes("fleet> ")) {
+          promptCount += 1;
+          if (promptCount === 2) {
+            resolve();
+          }
+        }
+      });
+    });
+
+    const rl = startInteractiveConsole(
+      context(),
+      new Map([["boom", new ThrowingCommand()]]),
+    );
+    try {
+      input.write("boom\n");
+      await secondPrompt; // resolves only if the console reprompts after the throw
+      // give the pending microtasks (including any stray unhandledRejection) a chance to fire
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.deepEqual(unhandledRejections, []);
+      assert.ok(logged.some((line) => line.includes("Command failed")));
+    } finally {
+      console.log = originalLog;
+      rl.close();
+      process.off("unhandledRejection", onUnhandledRejection);
+      Object.defineProperty(
+        process,
+        "stdin",
+        originalStdin as PropertyDescriptor,
+      );
+      Object.defineProperty(
+        process,
+        "stdout",
+        originalStdout as PropertyDescriptor,
+      );
+    }
   });
 });
